@@ -410,27 +410,11 @@ void App::sleepUntilNextPass() {
 }
 
 // ===========================================================================
-//  Manual UTC clock entry (no WiFi). Tilt the stick to change the highlighted
-//  field, KEY2 to move between fields, KEY1 to save (hold KEY1 to cancel).
-//  Returns true if the clock was set.
+//  Manual UTC clock entry (no WiFi), button-only: KEY2 increments the
+//  highlighted field (hold to auto-repeat), KEY1 moves to the next field, and
+//  a long-press of KEY1 saves. Returns true if the clock was set.
 // ===========================================================================
 bool App::manualTimeEntry() {
-  bool haveImu = M5.Imu.isEnabled();
-  if (!haveImu) {
-    // Without the IMU there's no analog input for the value; warn but still let
-    // the user back out cleanly. (All M5StickC Plus 1.1 units have an MPU6886,
-    // so this is just defensive.)
-    g->fillScreen(CL_BLACK);
-    header("Set UTC");
-    g->setTextSize(1);
-    g->setTextColor(CL_ORANGE, CL_BLACK);
-    g->setCursor(6, 40); g->print("IMU not available.");
-    g->setTextColor(CL_GREY, CL_BLACK);
-    g->setCursor(6, 56); g->print("Press KEY1 to go back.");
-    flush();
-    for (;;) { M5.update(); if (Keys::key1Clicked() || Keys::key1Held()) return false; delay(10); }
-  }
-
   // Seed from the current clock if valid, else a neutral default.
   struct tm tmv;
   time_t seed = timeIsSet() ? nowUtc() : 1735689600;  // 2025-01-01 00:00:00Z
@@ -446,35 +430,34 @@ bool App::manualTimeEntry() {
   int field = 0;                          // 0=Y 1=Mo 2=D 3=h 4=mi 5=se
   const char* labels[NF] = {"Year","Month","Day","Hour","Min","Sec"};
 
-  // Tilt input state: pitch from accel X (long axis). Past a threshold steps the
-  // value; holding the tilt auto-repeats with acceleration. Returning near
-  // level re-arms a fresh single step.
-  uint32_t lastStep = 0;
-  int      repeatN  = 0;
-
   auto daysInMonth = [](int y, int m) -> int {
     static const int d[] = {31,28,31,30,31,30,31,31,30,31,30,31};
     if (m == 2 && ((y % 4 == 0 && y % 100 != 0) || y % 400 == 0)) return 29;
     return d[(m - 1) % 12];
   };
   auto clampDay = [&]() { int dim = daysInMonth(Y, Mo); if (D > dim) D = dim; if (D < 1) D = 1; };
-  auto step = [&](int dir) {
+  auto inc = [&]() {                                    // increment current field (wraps)
     switch (field) {
-      case 0: Y  += dir; if (Y < 2020) Y = 2020; if (Y > 2099) Y = 2099; clampDay(); break;
-      case 1: Mo += dir; if (Mo < 1) Mo = 12; if (Mo > 12) Mo = 1; clampDay(); break;
-      case 2: { int dim = daysInMonth(Y, Mo); D += dir; if (D < 1) D = dim; if (D > dim) D = 1; } break;
-      case 3: h  += dir; if (h < 0) h = 23; if (h > 23) h = 0; break;
-      case 4: mi += dir; if (mi < 0) mi = 59; if (mi > 59) mi = 0; break;
-      case 5: se += dir; if (se < 0) se = 59; if (se > 59) se = 0; break;
+      case 0: Y++;  if (Y > 2099) Y = 2020; clampDay(); break;
+      case 1: Mo++; if (Mo > 12) Mo = 1;    clampDay(); break;
+      case 2: { int dim = daysInMonth(Y, Mo); D++; if (D > dim) D = 1; } break;
+      case 3: h++;  if (h > 23) h = 0;  break;
+      case 4: mi++; if (mi > 59) mi = 0; break;
+      case 5: se++; if (se > 59) se = 0; break;
     }
   };
+
+  // Button-only editor:
+  //   KEY2 short  -> increment the highlighted field (wraps)
+  //   KEY2 hold   -> auto-repeat increment (fast scroll; accelerates)
+  //   KEY1 short  -> move to the next field
+  //   KEY1 hold   -> save & exit
+  uint32_t repStart = 0, lastRep = 0; int repN = 0;
 
   for (;;) {
     M5.update();
 
-    // ---- Buttons ----
-    if (Keys::key1Held()) return false;                 // cancel
-    if (Keys::key1Clicked()) {                           // save
+    if (Keys::key1Held()) {                              // save
       // Civil UTC -> unix seconds (Howard Hinnant's algorithm), no timegm()
       // dependency and no reliance on the process timezone.
       int yy = Y - (Mo <= 2);
@@ -493,24 +476,19 @@ bool App::manualTimeEntry() {
       setStatus("Clock set", 2500);
       return true;
     }
-    if (Keys::key2Clicked()) { field = (field + 1) % NF; }
+    if (Keys::key1Clicked()) { field = (field + 1) % NF; }  // next field
 
-    // ---- Tilt (accel X = long axis with rotation 1) ----
-    float ax = 0, ay = 0, az = 0;
-    M5.Imu.getAccelData(&ax, &ay, &az);
-    // ax ~ 0 level, ~ +/-0.5..1.0 g when tilted along the long axis.
-    const float TH = 0.30f;                              // tilt threshold (g)
-    uint32_t now = millis();
-    if (fabsf(ax) > TH) {
-      // Auto-repeat: first step immediate, then accelerate while held.
-      uint32_t interval = (repeatN < 3) ? 320 : (repeatN < 8 ? 150 : 60);
-      if (now - lastStep >= interval) {
-        step(ax > 0 ? +1 : -1);
-        lastStep = now;
-        if (repeatN < 100) repeatN++;
+    // KEY2: single click increments; holding it auto-repeats (accelerating).
+    if (Keys::key2Clicked()) { inc(); repStart = millis(); lastRep = millis(); repN = 0; }
+    if (Keys::key2Down()) {
+      uint32_t now = millis();
+      if (repStart == 0) repStart = now;
+      if (now - repStart > 500) {                        // begin repeat after 0.5 s hold
+        uint32_t interval = (repN < 6) ? 160 : (repN < 16 ? 70 : 30);
+        if (now - lastRep >= interval) { inc(); lastRep = now; if (repN < 100) repN++; }
       }
     } else {
-      repeatN = 0; lastStep = 0;                         // re-arm when level
+      repStart = 0; repN = 0;                            // released -> re-arm
     }
 
     // ---- Draw ----
@@ -518,7 +496,7 @@ bool App::manualTimeEntry() {
     header("Set UTC");
     g->setTextSize(1);
     g->setTextColor(CL_GREY, CL_BLACK);
-    g->setCursor(4, 20); g->print("Tilt to change, KEY2 next");
+    g->setCursor(4, 20); g->print("KEY2 change  KEY1 next");
 
     char buf[20];
     snprintf(buf, sizeof(buf), "%04d-%02d-%02d", Y, Mo, D);
@@ -527,10 +505,9 @@ bool App::manualTimeEntry() {
     snprintf(buf, sizeof(buf), "%02d:%02d:%02d UTC", h, mi, se);
     g->setCursor(8, 64);  g->print(buf);
 
-    // Underline the active field.
-    // date row x-origins (size-2 font = 12px/char): Y@8 Mo@8+5*12 D@8+8*12
+    // Underline the active field (size-2 font = 12px/char).
     struct { int x, w; } pos[NF] = {
-      {8, 48}, {8 + 5*12, 24}, {8 + 8*12, 24},     // Y, Mo, D  (row y=38, h=16)
+      {8, 48}, {8 + 5*12, 24}, {8 + 8*12, 24},     // Y, Mo, D  (row y=38)
       {8, 24}, {8 + 3*12, 24}, {8 + 6*12, 24}      // h, mi, se (row y=64)
     };
     int uy = (field < 3) ? 56 : 82;
@@ -539,7 +516,7 @@ bool App::manualTimeEntry() {
     g->setTextColor(CL_GREEN, CL_BLACK);
     g->setCursor(4, 92); g->printf("field: %s", labels[field]);
     g->setTextColor(CL_GREY, CL_BLACK);
-    g->setCursor(4, 104); g->print("KEY1 save  (hold=cancel)");
+    g->setCursor(4, 104); g->print("hold KEY1 to save");
     flush();
 
     delay(20);
@@ -549,7 +526,7 @@ bool App::manualTimeEntry() {
 // ===========================================================================
 //  Re-open setup (KEY2 long-press): choose WiFi setup portal or manual clock.
 //  The WiFi path tries saved creds, then the captive portal; on finish it
-//  re-caches transponders. The manual-clock path sets UTC offline via tilt.
+//  re-caches transponders. The manual-clock path sets UTC offline via buttons.
 // ===========================================================================
 void App::reenterSetup() {
   // Chooser: long-press KEY2 lands here. Offer the WiFi setup portal (KEY1) or
@@ -564,7 +541,7 @@ void App::reenterSetup() {
     g->setCursor(6, 26); g->print("KEY1: WiFi setup");
     g->setCursor(16, 38); g->print("(location & satellites)");
     g->setCursor(6, 58); g->print("KEY2: Set clock manually");
-    g->setCursor(16, 70); g->print("(tilt to adjust, no WiFi)");
+    g->setCursor(16, 70); g->print("(buttons, no WiFi)");
     g->setTextColor(CL_GREY, CL_BLACK);
     g->setCursor(6, 96); g->print("hold KEY1 to cancel");
     flush();

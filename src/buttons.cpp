@@ -36,6 +36,9 @@ bool key2Clicked() { return M5.BtnB.wasClicked(); }
 // KEY2 long press: held past the threshold -> re-open setup.
 bool key2Held() { return M5.BtnB.wasHold(); }
 
+// KEY2 raw state: is the side key physically down right now? (for auto-repeat)
+bool key2Down() { return M5.BtnB.isPressed(); }
+
 int wakePin() { return s_wakePin; }
 
 } // namespace Keys
