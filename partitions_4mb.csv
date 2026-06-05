@@ -1,0 +1,9 @@
+# StickSat 4 MB partition table for the M5StickC Plus 1.1 (ESP32-PICO-D4, 4 MB flash)
+# Single app slot (no OTA) so the LittleFS data region is large enough for the
+# AMSAT GP cache (~75 KB+) plus up to 20 SatNOGS transponder caches.
+# Name,   Type, SubType, Offset,   Size
+nvs,      data, nvs,     0x9000,   0x5000
+otadata,  data, ota,     0xe000,   0x2000
+app0,     app,  factory, 0x10000,  0x280000
+spiffs,   data, spiffs,  0x290000, 0x160000
+coredump, data, coredump,0x3F0000, 0x10000
