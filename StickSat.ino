@@ -3281,8 +3281,6 @@ void setup() {
     if (haveWifi) net->syncTimeNtp();
     delete net;
   }
-    delete loc; delete db; delete net;
-  }
 
   // ---- Hand off to the App (re-loads settings/favs/GP from flash) ----------
   Serial.println("[boot] creating App");
