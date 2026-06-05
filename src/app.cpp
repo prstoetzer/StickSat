@@ -612,12 +612,30 @@ void App::drawPasses() {
   if (schedN == 0) {
     g->setTextColor(CL_YELLOW, CL_BLACK);
     g->setCursor(6, 44); g->print("No passes >= min elev.");
+    footer("KEY1 screen  KEY2 next sat");
+    return;
   }
   time_t now = nowUtc();
   uint32_t activeNorad = (favN ? favs[activeFav] : 0);
-  for (int i = 0; i < schedN && i < 9; ++i) {
+
+  // Up to 9 rows fit between the header and footer; the schedule can hold up to
+  // MAX_FAVS (20). Scroll a window so the active satellite is always visible:
+  // find its row, then choose the top row so the active one stays on screen and
+  // we never scroll past the end.
+  const int VIS = 9;
+  int activeRow = 0;
+  for (int i = 0; i < schedN; ++i) if (sched[i].norad == activeNorad) { activeRow = i; break; }
+  int top = 0;
+  if (schedN > VIS) {
+    top = activeRow - VIS / 2;               // try to centre the active row
+    if (top < 0) top = 0;
+    if (top > schedN - VIS) top = schedN - VIS;
+  }
+
+  for (int row = 0; row < VIS && (top + row) < schedN; ++row) {
+    int i = top + row;
     SchedEntry& e = sched[i];
-    int y = 28 + i*10;
+    int y = 28 + row*10;
     bool isActive = (e.norad == activeNorad);
     if (isActive) { g->fillRect(0, y-1, 240, 10, CL_GREEN);
                     g->setTextColor(CL_BLACK, CL_GREEN); }
@@ -629,10 +647,24 @@ void App::drawPasses() {
     int idx = db.indexOfNorad(e.norad);
     if (idx >= 0 && gpAgeDays(db.at(idx)) >= 14) {
       g->setTextColor(CL_RED, isActive ? CL_GREEN : CL_BLACK);
-      g->setCursor(232, y); g->print("!");
+      g->setCursor(226, y); g->print("!");
     }
   }
-  footer("KEY1 screen  KEY2 next sat");
+
+  // Scrollbar + position indicator when the list is longer than the window.
+  if (schedN > VIS) {
+    const int x = 236, y0 = 28, h = VIS * 10;     // track
+    g->drawRect(x, y0, 3, h, CL_GREY);
+    int thumbH = (h * VIS) / schedN; if (thumbH < 4) thumbH = 4;
+    int thumbY = y0 + (h - thumbH) * top / (schedN - VIS);
+    g->fillRect(x, thumbY, 3, thumbH, CL_CYAN);
+    // "n/N" position of the active satellite, shown in the footer line.
+    char pos[12]; snprintf(pos, sizeof(pos), "%d/%d", activeRow + 1, schedN);
+    g->setTextColor(CL_CYAN, CL_BLACK);
+    g->setCursor(208, 127); g->print(pos);
+  }
+
+  footer("KEY1 scrn KEY2 sat");
 }
 
 // ---- shared polar grid + arc (verbatim from CardSat) ----------------------
