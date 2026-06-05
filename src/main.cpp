@@ -69,55 +69,45 @@ void setup() {
   if (!cfg.load()) { cfg.save(); }   // first boot: write defaults
   Serial.printf("[boot] ssid='%s' setupDone=%d\n", cfg.ssid, cfg.setupDone);
 
-  // Only run the interactive setup phases on a *fresh* boot, not on a deep-
-  // sleep wake (where credentials and selection already exist).
+  // Interactive first-time setup runs ONLY when there are no saved WiFi
+  // credentials yet (a genuine first run) -- and never on a deep-sleep wake.
+  // On every later power-on we keep the saved credentials, try to connect, and
+  // go straight to the App regardless of success. If the connection fails the
+  // App shows a warning on the main screen, and a long-press of KEY2 drops into
+  // setup on demand. Location and satellite selection are always preserved on
+  // flash and reloaded by the App.
   bool fromSleep = (esp_sleep_get_wakeup_cause() == ESP_SLEEP_WAKEUP_TIMER) ||
                    (esp_sleep_get_wakeup_cause() == ESP_SLEEP_WAKEUP_EXT0);
 
-  if (!fromSleep) {
-    // NOTE: these helpers are heap-allocated, not stack locals. SatDb embeds a
-    // ~22 KB satellite catalog (SatEntry _sats[MAX_SATS]); a stack-local SatDb
-    // would overflow the ~8 KB Arduino loopTask stack and trigger a watchdog
-    // reset before setup() got anywhere. new/delete puts them on the heap.
-    Net*      net = new Net();
-    bool      haveWifi = false;
-
-    // ---- Phase 1: WiFi credentials (captive portal if none / if they fail) --
-    if (strlen(cfg.ssid) == 0) {
-      Serial.println("[boot] starting WiFi captive portal"); Serial.flush();
-      Portal::runWifiPortal(cfg, *net);         // saves cfg.ssid/pass on success
-      haveWifi = net->connected();
-    } else {
-      Serial.println("[boot] connecting to saved WiFi"); Serial.flush();
-      haveWifi = net->connect(cfg.ssid, cfg.pass, 15000);
-      if (!haveWifi) {                          // saved creds failed -> portal
-        Portal::runWifiPortal(cfg, *net);
-        haveWifi = net->connected();
-      }
-    }
-    Serial.printf("[boot] WiFi phase done (connected=%d)\n", haveWifi); Serial.flush();
-
-    // ---- Time sync once we have a connection --------------------------------
+  if (!fromSleep && strlen(cfg.ssid) == 0) {
+    // ---- True first run: no credentials -> captive portal + initial setup ---
+    // (heap-allocated; SatDb embeds a ~22 KB catalog that must not sit on the
+    // ~8 KB Arduino stack, which would overflow and watchdog-reset.)
+    Net* net = new Net();
+    Serial.println("[boot] first run: starting WiFi captive portal"); Serial.flush();
+    Portal::runWifiPortal(cfg, *net);             // blocks until connected; saves creds
+    bool haveWifi = net->connected();
     if (haveWifi) net->syncTimeNtp();
 
-    // ---- Phase 2: location + satellite picker -------------------------------
-    SatDb*    db = new SatDb();   // ~22 KB catalog -> heap, never the stack
-    db->begin();
-    db->loadGpFromFs();                         // cached GP, if any
+    SatDb*    db  = new SatDb(); db->begin(); db->loadGpFromFs();
     Location* loc = new Location();
-
-    // Always offer setup on first boot, or whenever it hasn't been completed,
-    // or when there's no GP data yet. (A finished unit skips straight to App.)
-    bool needSetup = !cfg.setupDone || (db->count() == 0);
-    if (haveWifi && needSetup) {
-      // If GP is missing, grab it before showing the picker so the list isn't
-      // empty (the setup page also has a manual re-download button).
+    if (haveWifi) {                               // run the location + sat picker
       if (db->count() == 0) { net->fetchGpToFile(cfg.gpUrl, FILE_GP); db->loadGpFromFs(); }
       Portal::runSetupServer(cfg, *db, *net, *loc);
     }
-
-    // Free the boot-phase helpers before App allocates its own copies; App
-    // re-reads everything (settings/favs/GP/transponders) from flash.
+    delete loc; delete db; delete net;
+  } else if (!fromSleep) {
+    // ---- Normal power-on: keep saved credentials, just try to connect -------
+    // Non-blocking w.r.t. setup: success or failure, we hand off to the App.
+    // (The App re-connects on its own too, but doing it here means the main
+    // screen already reflects the right state on first paint.)
+    Net* net = new Net();
+    Serial.println("[boot] connecting to saved WiFi"); Serial.flush();
+    bool haveWifi = net->connect(cfg.ssid, cfg.pass, 15000);
+    Serial.printf("[boot] saved WiFi connect = %d\n", haveWifi); Serial.flush();
+    if (haveWifi) net->syncTimeNtp();
+    delete net;
+  }
     delete loc; delete db; delete net;
   }
 

@@ -35,8 +35,16 @@ public:
   // Point the propagator at a satellite (renders its GP elements for SGP4).
   bool setSat(SatEntry& s);
 
-  // Compute az/el/range/range-rate at unix time `t` (UTC seconds).
+  // Compute az/el/range/range-rate at unix time `t` (UTC seconds). The double
+  // overload evaluates at the exact fractional instant (better Doppler near TCA).
   LiveLook look(time_t t);
+  LiveLook look(double tSec);
+
+  // Range rate (km/s, +ve = receding) at a fractional Unix instant, taken from
+  // the SGP4 velocity vector -- the method Gpredict uses. Propagates with the
+  // WGS72 gravity set (the constants the elements are fit to) via the free
+  // sgp4() function, since the library keeps `whichconst` private.
+  double rangeRateAt(double unixSec);
 
   // Lightweight: just az/el (degrees) for the current site at time t.
   bool azelAt(time_t t, double& az, double& el);
@@ -66,5 +74,6 @@ private:
   Sgp4   _sat;
   Observer _o;
   bool   _haveSat = false;
+  double _epochUnix = 0;          // element-set epoch (Unix s), for rangeRateAt
   char   _name[26], _l1[72], _l2[72];
 };

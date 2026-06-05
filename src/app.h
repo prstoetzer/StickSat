@@ -23,13 +23,16 @@
 
 enum Screen : uint8_t { SCR_PASSES = 0, SCR_POLAR, SCR_TRACK, SCR_COUNT };
 
-// One upcoming (or in-progress) pass for a selected satellite.
+// One upcoming (or in-progress) pass for a selected satellite. Every selected
+// favorite gets an entry, even if no near-term pass was found (hasPass=false),
+// so the Next Passes list always shows all of them.
 struct SchedEntry {
   uint32_t norad = 0;
   char     name[26] = {0};
   time_t   aos = 0, los = 0;
   float    maxEl = 0;
   bool     inProgress = false;
+  bool     hasPass = false;   // false => no upcoming pass found (shown at bottom)
 };
 
 class App {
@@ -84,6 +87,7 @@ private:
   // ---- helpers ----
   void setStatus(const String& s, uint32_t ms = 2500);
   time_t nowUtc();
+  double nowUtcFrac();             // fractional UTC seconds (for live Doppler)
   SatEntry* activeSat();
   void loadFavsFromFile();
   bool ensureTransponders(SatEntry& s);   // load active sat's transponders
@@ -94,6 +98,7 @@ private:
   void serviceAosAlarm();
   void sleepUntilNextPass();               // deep-sleep until ~60 s before AOS
   void reenterSetup();                     // KEY2 long-press: re-open setup portal
+  bool manualTimeEntry();                  // tilt+button UTC clock setter (no WiFi)
   void drawPolarGrid(int cx, int cy, int R);
   void drawPolarArc(int cx, int cy, int R, const float* az, const float* el, int n);
 

@@ -22,6 +22,21 @@
 #include <sys/time.h>
 #include <math.h>
 #include <esp_sleep.h>
+#include <esp_timer.h>
+
+// ---------------------------------------------------------------------------
+//  Clock preservation across deep sleep
+// ---------------------------------------------------------------------------
+//  The ESP32 RTC keeps gettimeofday() running across a deep-sleep wake, but to
+//  be robust against clock-source quirks (and so the clock is restored as early
+//  as possible on wake, before WiFi), we stash a wall-clock anchor in RTC slow
+//  memory, which survives deep sleep (but not a power-on reset). On boot we
+//  reconstruct UTC = saved_walltime + (rtc_time_now - saved_rtc_time), i.e. the
+//  anchor plus however long the RTC has advanced since we saved it. This keeps
+//  the unit fully usable offline through sleep cycles, with no WiFi/NTP needed.
+RTC_DATA_ATTR static uint64_t s_rtcAnchorWall = 0;   // UTC seconds at save time
+RTC_DATA_ATTR static uint64_t s_rtcAnchorMono = 0;   // esp_timer us at save time
+RTC_DATA_ATTR static bool     s_rtcAnchorValid = false;
 
 // 16-bit 565 colours (same palette CardSat used)
 static const uint16_t CL_BLACK=0x0000, CL_WHITE=0xFFFF, CL_GREEN=0x07E0, CL_RED=0xF800,
@@ -133,6 +148,22 @@ void App::setup() {
 
   setenv("TZ", "UTC0", 1); tzset();          // work entirely in UTC
 
+  // Restore the clock from the RTC-memory anchor (survives deep sleep) BEFORE
+  // touching WiFi, so the unit is immediately usable offline after a wake. We
+  // reconstruct UTC = anchor_wall + elapsed, where elapsed comes from the
+  // monotonic timer that keeps counting through deep sleep. Only do this if the
+  // system clock isn't already valid (e.g. it persisted on its own).
+  if (s_rtcAnchorValid && !timeIsSet()) {
+    int64_t nowMono = esp_timer_get_time();                 // us since boot, incl sleep
+    int64_t elapsed = (nowMono - (int64_t)s_rtcAnchorMono); // us since anchor
+    if (elapsed < 0) elapsed = 0;
+    double wall = (double)s_rtcAnchorWall + elapsed / 1e6;
+    struct timeval tv; tv.tv_sec = (time_t)wall;
+    tv.tv_usec = (suseconds_t)((wall - tv.tv_sec) * 1e6);
+    settimeofday(&tv, nullptr);
+    Serial.printf("[clock] restored from RTC anchor: %ld\n", (long)tv.tv_sec);
+  }
+
   db.begin();
   if (!cfg.load()) cfg.save();               // load persisted settings
   if (cfg.lat != 0.0 || cfg.lon != 0.0) loc.setManual(cfg.lat, cfg.lon, cfg.altM);
@@ -146,6 +177,14 @@ void App::setup() {
   // cache. (On a deep-sleep wake this re-establishes the link quietly.)
   if (strlen(cfg.ssid) && !net.connected()) net.connect(cfg.ssid, cfg.pass, 12000);
   if (net.connected() && !timeIsSet()) net.syncTimeNtp();
+
+  // Once we have a valid clock (restored or NTP-synced), refresh the RTC anchor
+  // so a subsequent sleep/wake reconstructs from the freshest reference.
+  if (timeIsSet()) {
+    s_rtcAnchorWall  = (uint64_t)time(nullptr);
+    s_rtcAnchorMono  = (uint64_t)esp_timer_get_time();
+    s_rtcAnchorValid = true;
+  }
 
   if (favN && timeIsSet()) buildSchedule();
   onActiveSatChanged();
@@ -169,6 +208,15 @@ void App::setStatus(const String& s, uint32_t ms) {
 }
 
 time_t App::nowUtc() { return time(nullptr); }
+
+// Current UTC as a fractional second (seconds + microseconds). Used for the
+// live Doppler/polar so range rate is evaluated at the exact instant rather
+// than quantised to whole seconds (matters near TCA where Doppler moves fast).
+double App::nowUtcFrac() {
+  struct timeval tv;
+  if (gettimeofday(&tv, nullptr) == 0) return (double)tv.tv_sec + tv.tv_usec * 1e-6;
+  return (double)time(nullptr);
+}
 
 void App::loadFavsFromFile() {
   favN = Favs::load(favs, MAX_FAVS);
@@ -345,6 +393,15 @@ void App::sleepUntilNextPass() {
   M5.Display.sleep();
   M5.Display.waitDisplay();
 
+  // Stash a wall-clock anchor in RTC memory so the clock can be reconstructed
+  // immediately on wake without WiFi (see App::setup). Pair the current UTC with
+  // the monotonic timer, which keeps counting through deep sleep.
+  if (timeIsSet()) {
+    s_rtcAnchorWall  = (uint64_t)time(nullptr);
+    s_rtcAnchorMono  = (uint64_t)esp_timer_get_time();
+    s_rtcAnchorValid = true;
+  }
+
   // Wake on KEY1 (front button, active-low) via ext0; and on the timer if we
   // have a scheduled pass. A KEY1 press while asleep brings us back.
   esp_sleep_enable_ext0_wakeup((gpio_num_t)Keys::wakePin(), BTN_WAKE_LEVEL);
@@ -353,13 +410,187 @@ void App::sleepUntilNextPass() {
 }
 
 // ===========================================================================
-//  Re-open the setup web portal (KEY2 long-press) so the user can change their
-//  location and satellite selection without re-flashing. Requires WiFi: try
-//  the saved network first, then fall back to the captive portal. On finish,
-//  the setup server re-caches transponders for the (possibly new) sat list, so
-//  we just reload everything from flash afterward.
+//  Manual UTC clock entry (no WiFi). Tilt the stick to change the highlighted
+//  field, KEY2 to move between fields, KEY1 to save (hold KEY1 to cancel).
+//  Returns true if the clock was set.
+// ===========================================================================
+bool App::manualTimeEntry() {
+  bool haveImu = M5.Imu.isEnabled();
+  if (!haveImu) {
+    // Without the IMU there's no analog input for the value; warn but still let
+    // the user back out cleanly. (All M5StickC Plus 1.1 units have an MPU6886,
+    // so this is just defensive.)
+    g->fillScreen(CL_BLACK);
+    header("Set UTC");
+    g->setTextSize(1);
+    g->setTextColor(CL_ORANGE, CL_BLACK);
+    g->setCursor(6, 40); g->print("IMU not available.");
+    g->setTextColor(CL_GREY, CL_BLACK);
+    g->setCursor(6, 56); g->print("Press KEY1 to go back.");
+    flush();
+    for (;;) { M5.update(); if (Keys::key1Clicked() || Keys::key1Held()) return false; delay(10); }
+  }
+
+  // Seed from the current clock if valid, else a neutral default.
+  struct tm tmv;
+  time_t seed = timeIsSet() ? nowUtc() : 1735689600;  // 2025-01-01 00:00:00Z
+  gmtime_r(&seed, &tmv);
+  int Y  = tmv.tm_year + 1900;
+  int Mo = tmv.tm_mon + 1;
+  int D  = tmv.tm_mday;
+  int h  = tmv.tm_hour;
+  int mi = tmv.tm_min;
+  int se = tmv.tm_sec;
+
+  const int NF = 6;
+  int field = 0;                          // 0=Y 1=Mo 2=D 3=h 4=mi 5=se
+  const char* labels[NF] = {"Year","Month","Day","Hour","Min","Sec"};
+
+  // Tilt input state: pitch from accel X (long axis). Past a threshold steps the
+  // value; holding the tilt auto-repeats with acceleration. Returning near
+  // level re-arms a fresh single step.
+  uint32_t lastStep = 0;
+  int      repeatN  = 0;
+
+  auto daysInMonth = [](int y, int m) -> int {
+    static const int d[] = {31,28,31,30,31,30,31,31,30,31,30,31};
+    if (m == 2 && ((y % 4 == 0 && y % 100 != 0) || y % 400 == 0)) return 29;
+    return d[(m - 1) % 12];
+  };
+  auto clampDay = [&]() { int dim = daysInMonth(Y, Mo); if (D > dim) D = dim; if (D < 1) D = 1; };
+  auto step = [&](int dir) {
+    switch (field) {
+      case 0: Y  += dir; if (Y < 2020) Y = 2020; if (Y > 2099) Y = 2099; clampDay(); break;
+      case 1: Mo += dir; if (Mo < 1) Mo = 12; if (Mo > 12) Mo = 1; clampDay(); break;
+      case 2: { int dim = daysInMonth(Y, Mo); D += dir; if (D < 1) D = dim; if (D > dim) D = 1; } break;
+      case 3: h  += dir; if (h < 0) h = 23; if (h > 23) h = 0; break;
+      case 4: mi += dir; if (mi < 0) mi = 59; if (mi > 59) mi = 0; break;
+      case 5: se += dir; if (se < 0) se = 59; if (se > 59) se = 0; break;
+    }
+  };
+
+  for (;;) {
+    M5.update();
+
+    // ---- Buttons ----
+    if (Keys::key1Held()) return false;                 // cancel
+    if (Keys::key1Clicked()) {                           // save
+      // Civil UTC -> unix seconds (Howard Hinnant's algorithm), no timegm()
+      // dependency and no reliance on the process timezone.
+      int yy = Y - (Mo <= 2);
+      long era = (yy >= 0 ? yy : yy - 399) / 400;
+      unsigned yoe = (unsigned)(yy - era * 400);
+      unsigned doy = (153 * (Mo + (Mo > 2 ? -3 : 9)) + 2) / 5 + D - 1;
+      unsigned doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+      long days = era * 146097 + (long)doe - 719468;
+      time_t utc = (time_t)days * 86400 + h * 3600 + mi * 60 + se;
+      struct timeval tv = { utc, 0 };
+      settimeofday(&tv, nullptr);
+      // Refresh the deep-sleep clock anchor so it survives sleep from here on.
+      s_rtcAnchorWall  = (uint64_t)utc;
+      s_rtcAnchorMono  = (uint64_t)esp_timer_get_time();
+      s_rtcAnchorValid = true;
+      setStatus("Clock set", 2500);
+      return true;
+    }
+    if (Keys::key2Clicked()) { field = (field + 1) % NF; }
+
+    // ---- Tilt (accel X = long axis with rotation 1) ----
+    float ax = 0, ay = 0, az = 0;
+    M5.Imu.getAccelData(&ax, &ay, &az);
+    // ax ~ 0 level, ~ +/-0.5..1.0 g when tilted along the long axis.
+    const float TH = 0.30f;                              // tilt threshold (g)
+    uint32_t now = millis();
+    if (fabsf(ax) > TH) {
+      // Auto-repeat: first step immediate, then accelerate while held.
+      uint32_t interval = (repeatN < 3) ? 320 : (repeatN < 8 ? 150 : 60);
+      if (now - lastStep >= interval) {
+        step(ax > 0 ? +1 : -1);
+        lastStep = now;
+        if (repeatN < 100) repeatN++;
+      }
+    } else {
+      repeatN = 0; lastStep = 0;                         // re-arm when level
+    }
+
+    // ---- Draw ----
+    g->fillScreen(CL_BLACK);
+    header("Set UTC");
+    g->setTextSize(1);
+    g->setTextColor(CL_GREY, CL_BLACK);
+    g->setCursor(4, 20); g->print("Tilt to change, KEY2 next");
+
+    char buf[20];
+    snprintf(buf, sizeof(buf), "%04d-%02d-%02d", Y, Mo, D);
+    g->setTextSize(2);
+    g->setCursor(8, 38);  g->setTextColor(CL_WHITE, CL_BLACK); g->print(buf);
+    snprintf(buf, sizeof(buf), "%02d:%02d:%02d UTC", h, mi, se);
+    g->setCursor(8, 64);  g->print(buf);
+
+    // Underline the active field.
+    // date row x-origins (size-2 font = 12px/char): Y@8 Mo@8+5*12 D@8+8*12
+    struct { int x, w; } pos[NF] = {
+      {8, 48}, {8 + 5*12, 24}, {8 + 8*12, 24},     // Y, Mo, D  (row y=38, h=16)
+      {8, 24}, {8 + 3*12, 24}, {8 + 6*12, 24}      // h, mi, se (row y=64)
+    };
+    int uy = (field < 3) ? 56 : 82;
+    g->fillRect(pos[field].x, uy, pos[field].w, 2, CL_GREEN);
+    g->setTextSize(1);
+    g->setTextColor(CL_GREEN, CL_BLACK);
+    g->setCursor(4, 92); g->printf("field: %s", labels[field]);
+    g->setTextColor(CL_GREY, CL_BLACK);
+    g->setCursor(4, 104); g->print("KEY1 save  (hold=cancel)");
+    flush();
+
+    delay(20);
+  }
+}
+
+// ===========================================================================
+//  Re-open setup (KEY2 long-press): choose WiFi setup portal or manual clock.
+//  The WiFi path tries saved creds, then the captive portal; on finish it
+//  re-caches transponders. The manual-clock path sets UTC offline via tilt.
 // ===========================================================================
 void App::reenterSetup() {
+  // Chooser: long-press KEY2 lands here. Offer the WiFi setup portal (KEY1) or
+  // a no-WiFi manual UTC clock set (KEY2). This lets the user fix the clock when
+  // out of WiFi range without going through the portal at all.
+  for (;;) {
+    g->fillScreen(CL_BLACK);
+    g->setTextSize(1);
+    g->setTextColor(CL_CYAN, CL_BLACK);
+    g->setCursor(6, 6);  g->print("Setup");
+    g->setTextColor(CL_WHITE, CL_BLACK);
+    g->setCursor(6, 26); g->print("KEY1: WiFi setup");
+    g->setCursor(16, 38); g->print("(location & satellites)");
+    g->setCursor(6, 58); g->print("KEY2: Set clock manually");
+    g->setCursor(16, 70); g->print("(tilt to adjust, no WiFi)");
+    g->setTextColor(CL_GREY, CL_BLACK);
+    g->setCursor(6, 96); g->print("hold KEY1 to cancel");
+    flush();
+
+    // Wait for a choice.
+    bool chosen = false, doManual = false, cancel = false;
+    while (!chosen) {
+      M5.update();
+      if (Keys::key1Held())   { cancel = true;  chosen = true; }
+      else if (Keys::key2Clicked()) { doManual = true; chosen = true; }
+      else if (Keys::key1Clicked()) { doManual = false; chosen = true; }
+      delay(5);
+    }
+    if (cancel) { lastDrawMs = 0; draw(); return; }
+    if (doManual) {
+      if (manualTimeEntry()) {
+        // Clock now set -> rebuild schedule and return to the main screen.
+        if (favN && timeIsSet()) buildSchedule();
+        onActiveSatChanged();
+      }
+      screen = SCR_PASSES; lastDrawMs = 0; draw();
+      return;
+    }
+    break;   // KEY1 -> fall through to the WiFi setup path below
+  }
+
   // Show a short banner so the long-press feels acknowledged.
   g->fillScreen(CL_BLACK);
   g->setTextSize(1);
@@ -537,11 +768,25 @@ void App::header(const String& t) {
     if (fw > 0) g->fillRect(bx + 1, by + 1, fw, bh - 2, col);
   }
 
-  // Clock left of the battery.
-  String clk; int rightLimit = bx;
+  // Offline indicator: a red "NW" (no-WiFi) tag left of the battery whenever we
+  // are not connected, so every screen shows the warning. Reserve its slot so
+  // the clock doesn't overlap it.
+  bool online = net.connected();
+  const int nwW = 16;                       // width reserved for the tag
+  int nwRight = bx - 4;                      // right edge of the indicator zone
+  if (!online) {
+    g->setTextColor(CL_RED, CL_BLUE);
+    g->setTextSize(1);
+    g->setCursor(nwRight - nwW + 2, 4);
+    g->print("NW");                          // "No WiFi"
+  }
+  int clkRight = online ? bx : (nwRight - nwW); // clock ends before NW tag if offline
+
+  // Clock left of the battery / offline tag.
+  String clk; int rightLimit = clkRight;
   if (timeIsSet()) {
     clk = fmtClock(nowUtc()) + "Z";
-    rightLimit = bx - (int)clk.length() * 6 - 5;
+    rightLimit = clkRight - (int)clk.length() * 6 - 5;
   }
   const int titleX = 3, charW = 12, gap = 4;
   int maxChars = (rightLimit - gap - titleX) / charW; if (maxChars < 1) maxChars = 1;
@@ -553,7 +798,7 @@ void App::header(const String& t) {
   g->setTextSize(1);
   if (clk.length()) {
     g->setTextColor(CL_WHITE, CL_BLUE);
-    g->setCursor(bx - (int)clk.length() * 6 - 5, 4);
+    g->setCursor(clkRight - (int)clk.length() * 6 - 5, 4);
     g->print(clk);
   }
 }
@@ -574,8 +819,12 @@ void App::draw() {
     g->setTextColor(CL_YELLOW, CL_BLACK);
     g->setCursor(6, 40); g->print("No satellites selected.");
     g->setTextColor(CL_WHITE, CL_BLACK);
-    g->setCursor(6, 54); g->print("Re-run setup over WiFi to");
-    g->setCursor(6, 64); g->print("pick satellites & location.");
+    g->setCursor(6, 54); g->print("Long-press KEY2 to open");
+    g->setCursor(6, 64); g->print("setup (location & sats).");
+    if (!net.connected()) {
+      g->setTextColor(CL_ORANGE, CL_BLACK);
+      g->setCursor(6, 80); g->print("WiFi not connected.");
+    }
     flush();
     return;
   }
@@ -761,7 +1010,7 @@ void App::drawPolar() {
   drawPolarGrid(cx, cy, R);
   if (polarPathValid) drawPolarArc(cx, cy, R, polarAz, polarEl, POLAR_PTS);
 
-  LiveLook L = timeIsSet() ? pred.look(nowUtc()) : LiveLook();
+  LiveLook L = timeIsSet() ? pred.look(nowUtcFrac()) : LiveLook();
 
   if (timeIsSet() && L.el > 0) {              // live position marker (sat is up)
     double rr = R * (90.0 - L.el) / 90.0;
@@ -782,24 +1031,45 @@ void App::drawPolar() {
 
   int rx = 128;
   g->setTextColor(L.visible ? CL_GREEN : CL_GREY, CL_BLACK);
-  g->setCursor(rx, 22);
+  g->setCursor(rx, 20);
   if (L.visible)             g->print("VISIBLE");          // current pass
-  else if (polarPathValid)   g->printf("next %s", fmtHM(polarPass.aos).c_str());
+  else if (polarPathValid)   g->print("next pass");
   else                       g->print("below horizon");
+
   g->setTextColor(CL_WHITE, CL_BLACK);
-  g->setCursor(rx, 40); g->printf("Az  %5.1f", L.az);
-  g->setCursor(rx, 52); g->printf("El  %5.1f", L.el);
-  g->setCursor(rx, 64); g->printf("Rng %.0f km", L.rangeKm);
-  g->setCursor(rx, 76); g->printf("%s %.3f km/s",
-                  L.rangeRate >= 0 ? "away" : "appr", fabs(L.rangeRate));
+  g->setCursor(rx, 31); g->printf("Az %5.1f", L.az);
+  g->setCursor(rx, 42); g->printf("El %5.1f", L.el);
+  g->setCursor(rx, 53); g->printf("Rng %.0fkm", L.rangeKm);
+  g->setCursor(rx, 64); g->printf("%s %.2fkm/s",
+                  L.rangeRate >= 0 ? "ds" : "as", fabs(L.rangeRate));
+
+  // AOS / LOS of the pass the polar arc represents (current pass if the sat is
+  // up, else the next pass). polarPass holds its aos/los/maxEl.
+  if (polarPathValid) {
+    time_t now = nowUtc();
+    // Time to AOS (next pass) or remaining to LOS (pass in progress).
+    long dt = L.visible ? (long)(polarPass.los - now) : (long)(polarPass.aos - now);
+    if (dt < 0) dt = 0;
+    g->setTextColor(CL_GREEN, CL_BLACK);
+    g->setCursor(rx, 77);  g->printf("AOS %s", fmtHM(polarPass.aos).c_str());
+    g->setTextColor(CL_ORANGE, CL_BLACK);
+    g->setCursor(rx, 88);  g->printf("LOS %s", fmtHM(polarPass.los).c_str());
+    // Right of LOS: peak elevation of this pass.
+    g->setTextColor(CL_GREY, CL_BLACK);
+    g->setCursor(rx + 66, 88); g->printf("mx%.0f", polarPass.maxEl);
+    // Right of AOS: countdown -- "-" = time left this pass, "+" = until next AOS.
+    g->setCursor(rx + 66, 77); g->printf("%s%s", L.visible ? "-" : "+",
+                                          fmtCountdown(dt).c_str());
+  }
+
   if (timeIsSet()) {
-    g->setTextColor(CL_YELLOW, CL_BLACK);
-    g->setCursor(rx, 88); g->printf("Sun %03.0f/%+.0f", L.sunAz, L.sunEl);
     g->setTextColor(L.sunlit ? CL_GREEN : CL_ORANGE, CL_BLACK);
-    g->setCursor(rx, 100); g->print(L.sunlit ? "sat SUNLIT" : "sat ECLIPSE");
+    g->setCursor(rx, 101); g->print(L.sunlit ? "SUNLIT" : "ECLIPSE");
+    g->setTextColor(CL_YELLOW, CL_BLACK);
+    g->setCursor(rx + 60, 101); g->printf("Sun%+.0f", L.sunEl);
   } else {
     g->setTextColor(CL_YELLOW, CL_BLACK);
-    g->setCursor(rx, 96); g->print("clock not set");
+    g->setCursor(rx, 101); g->print("clock not set");
   }
   footer("KEY1 screen  KEY2 next sat");
 }
@@ -814,7 +1084,7 @@ void App::drawTrack() {
   g->setTextSize(1);
   if (!s) { footer("KEY1 next screen"); return; }
 
-  LiveLook L = timeIsSet() ? pred.look(nowUtc()) : LiveLook();
+  LiveLook L = timeIsSet() ? pred.look(nowUtcFrac()) : LiveLook();
 
   // Az / El / range / range-rate.
   g->setTextColor(L.visible ? CL_GREEN : CL_GREY, CL_BLACK);

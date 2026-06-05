@@ -61,6 +61,11 @@ and the orange T-minus strip overlay on every screen, exactly as in CardSat.
 
 ## First-boot setup
 
+The interactive setup below runs **only on the very first boot** (when no WiFi
+credentials are stored yet). After that, credentials, location, and your
+satellite selection are saved on flash and StickSat goes straight to tracking on
+every power-on — see "Normal power-on" below.
+
 1. Power on. With no saved WiFi, StickSat starts a SoftAP **`StickSat-Setup`**
    with a captive portal. Join it from a phone/laptop; the setup page should pop
    up automatically (or browse to `192.168.4.1`). Pick your 2.4 GHz network and
@@ -80,11 +85,23 @@ and the orange T-minus strip overlay on every screen, exactly as in CardSat.
    / out of WiFi range** — the Track screen's Doppler and transponder values
    come from the cache, no network needed.
 
-To change the network, location, or satellite list later, **long-press KEY2**
-on any screen. StickSat reconnects to WiFi (or re-opens the captive portal if
-the saved network isn't reachable, e.g. you've moved), serves the setup page
-again, and on Finish re-caches transponders for the updated list. A factory
-reset (erase flash) or re-flash also re-runs first-boot setup.
+## Normal power-on (after first setup)
+
+StickSat **never returns to initial setup on its own**. On every power-on it
+keeps the saved WiFi credentials and tries to connect to that network:
+
+- **Connected** — the clock NTP-syncs, fresh data can be fetched, and it lands
+  on the Next Passes screen.
+- **Not connected** — it still goes straight to the main screen and runs from the
+  cached GP / transponder data and the deep-sleep-preserved clock. A red **`NW`**
+  ("No WiFi") tag shows in the header on every screen as the warning.
+
+To change the network, location, or satellite list at any time, **long-press
+KEY2** on any screen. StickSat reconnects to WiFi (or re-opens the captive
+portal if the saved network isn't reachable — e.g. you've moved), serves the
+setup page again, and on Finish re-caches transponders for the updated list.
+Location and satellite selection are always preserved on flash; a factory reset
+(erase flash) or re-flash is the only thing that returns to first-boot setup.
 
 ---
 
