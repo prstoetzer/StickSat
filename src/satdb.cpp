@@ -22,11 +22,23 @@ static void rstrip(char* s) {
   while (n > 0 && (s[n-1] == '\r' || s[n-1] == ' ' || s[n-1] == '\n')) s[--n] = 0;
 }
 
-// ---- EPOCH "YYYY-MM-DD HH:MM:SS.ffffff" -> Unix UTC seconds (fractional) ----
-// Civil-from-days (Howard Hinnant) so it never depends on the process TZ.
+// ---- EPOCH "YYYY-MM-DDTHH:MM:SS.ffffff" -> Unix UTC seconds (fractional) ----
+// CelesTrak / AMSAT OMM JSON uses an ISO-8601 'T' between date and time (e.g.
+// "2024-05-06T19:53:04.999776"); some sources use a space. We accept either by
+// scanning the date and time parts separately rather than matching a literal
+// separator -- a previous version assumed a space, which silently dropped the
+// time-of-day and offset every satellite's epoch to midnight (causing pass
+// times to be off by minutes). Civil-from-days (Hinnant) so it never depends on
+// the process TZ. A trailing 'Z' (UTC) is harmless and ignored.
 double SatDb::gpEpochToUnix(const char* s) {
+  if (!s) return 0.0;
   int Y = 0, Mo = 1, D = 1, h = 0, mi = 0; double se = 0.0;
-  if (sscanf(s, "%d-%d-%d %d:%d:%lf", &Y, &Mo, &D, &h, &mi, &se) < 3) return 0.0;
+  // Date part.
+  if (sscanf(s, "%d-%d-%d", &Y, &Mo, &D) < 3) return 0.0;
+  // Time part: find the 'T' or space separator, then parse HH:MM:SS.fff.
+  const char* tp = strchr(s, 'T');
+  if (!tp) tp = strchr(s, ' ');
+  if (tp) sscanf(tp + 1, "%d:%d:%lf", &h, &mi, &se);
   int y = Y - (Mo <= 2);
   long era = (y >= 0 ? y : y - 399) / 400;
   unsigned yoe = (unsigned)(y - era * 400);
