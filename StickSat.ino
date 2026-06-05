@@ -468,13 +468,16 @@ namespace Portal {
 
 enum Screen : uint8_t { SCR_PASSES = 0, SCR_POLAR, SCR_TRACK, SCR_COUNT };
 
-// One upcoming (or in-progress) pass for a selected satellite.
+// One upcoming (or in-progress) pass for a selected satellite. Every selected
+// favorite gets an entry, even if no near-term pass was found (hasPass=false),
+// so the Next Passes list always shows all of them.
 struct SchedEntry {
   uint32_t norad = 0;
   char     name[26] = {0};
   time_t   aos = 0, los = 0;
   float    maxEl = 0;
   bool     inProgress = false;
+  bool     hasPass = false;   // false => no upcoming pass found (shown at bottom)
 };
 
 class App {
@@ -2158,19 +2161,29 @@ void App::buildSchedule() {
   time_t now = nowUtc();
   pred.setSite(loc.obs());
 
+  // One row per selected favorite -- we never skip a satellite. If no upcoming
+  // pass can be found (or its GP is missing), it still gets a row with
+  // hasPass=false so all selected sats are always visible/scrollable.
   for (int i = 0; i < favN && schedN < SCHED_MAX; ++i) {
-    int idx = db.indexOfNorad(favs[i]);
-    if (idx < 0) continue;
-    SatEntry& s = db.at(idx);
-    if (!pred.setSat(s)) continue;
-
     SchedEntry e;
-    e.norad = s.norad;
+    e.norad = favs[i];
+
+    int idx = db.indexOfNorad(favs[i]);
+    if (idx < 0) {
+      // Favorite not present in the GP catalog (e.g. dropped from the bulletin).
+      snprintf(e.name, sizeof(e.name), "NORAD %lu", (unsigned long)favs[i]);
+      e.hasPass = false;
+      sched[schedN++] = e;
+      continue;
+    }
+    SatEntry& s = db.at(idx);
     strncpy(e.name, s.name, sizeof(e.name) - 1); e.name[sizeof(e.name) - 1] = 0;
+
+    if (!pred.setSat(s)) { e.hasPass = false; sched[schedN++] = e; continue; }
 
     LiveLook L = pred.look(now);
     if (L.el >= 0.0) {
-      e.inProgress = true; e.aos = now; e.maxEl = (float)L.el;
+      e.hasPass = true; e.inProgress = true; e.aos = now; e.maxEl = (float)L.el;
       time_t t = now, los = now;
       for (int k = 0; k < 120; ++k) {            // up to 60 min, 30 s steps
         t += 30; LiveLook l2 = pred.look(t);
@@ -2181,22 +2194,30 @@ void App::buildSchedule() {
       e.los = los;
     } else {
       PassPredict p;
-      if (pred.predictPasses(now, cfg.minPassEl, &p, 1) < 1) continue;
-      e.inProgress = false; e.aos = p.aos; e.los = p.los; e.maxEl = p.maxEl;
+      if (pred.predictPasses(now, cfg.minPassEl, &p, 1) >= 1) {
+        e.hasPass = true; e.inProgress = false;
+        e.aos = p.aos; e.los = p.los; e.maxEl = p.maxEl;
+      } else {
+        e.hasPass = false;                       // no pass found -> keep, show last
+      }
     }
     sched[schedN++] = e;
   }
 
-  // Insertion sort by AOS.
+  // Sort by AOS, but push the no-pass entries to the bottom (treat them as
+  // "infinitely far"). Insertion sort on a composite key.
+  auto keyOf = [](const SchedEntry& e) -> time_t {
+    return e.hasPass ? e.aos : (time_t)0x7FFFFFFFFFFFFFFFLL;
+  };
   for (int i = 1; i < schedN; ++i) {
-    SchedEntry key = sched[i]; int j = i - 1;
-    while (j >= 0 && sched[j].aos > key.aos) { sched[j+1] = sched[j]; --j; }
+    SchedEntry key = sched[i]; time_t kk = keyOf(key); int j = i - 1;
+    while (j >= 0 && keyOf(sched[j]) > kk) { sched[j+1] = sched[j]; --j; }
     sched[j+1] = key;
   }
 
   // Soonest *future* AOS feeds the alarm.
   for (int i = 0; i < schedN; ++i) {
-    if (!sched[i].inProgress && sched[i].aos > now) {
+    if (sched[i].hasPass && !sched[i].inProgress && sched[i].aos > now) {
       nextAos = sched[i].aos;
       strncpy(nextAosName, sched[i].name, sizeof(nextAosName) - 1);
       nextAosName[sizeof(nextAosName) - 1] = 0;
@@ -2546,27 +2567,64 @@ void App::drawPasses() {
   if (schedN == 0) {
     g->setTextColor(CL_YELLOW, CL_BLACK);
     g->setCursor(6, 44); g->print("No passes >= min elev.");
+    footer("KEY1 screen  KEY2 next sat");
+    return;
   }
   time_t now = nowUtc();
   uint32_t activeNorad = (favN ? favs[activeFav] : 0);
-  for (int i = 0; i < schedN && i < 9; ++i) {
+
+  // Up to 9 rows fit between the header and footer; the schedule can hold up to
+  // MAX_FAVS (20). Scroll a window so the active satellite is always visible:
+  // find its row, then choose the top row so the active one stays on screen and
+  // we never scroll past the end.
+  const int VIS = 9;
+  int activeRow = 0;
+  for (int i = 0; i < schedN; ++i) if (sched[i].norad == activeNorad) { activeRow = i; break; }
+  int top = 0;
+  if (schedN > VIS) {
+    top = activeRow - VIS / 2;               // try to centre the active row
+    if (top < 0) top = 0;
+    if (top > schedN - VIS) top = schedN - VIS;
+  }
+
+  for (int row = 0; row < VIS && (top + row) < schedN; ++row) {
+    int i = top + row;
     SchedEntry& e = sched[i];
-    int y = 28 + i*10;
+    int y = 28 + row*10;
     bool isActive = (e.norad == activeNorad);
     if (isActive) { g->fillRect(0, y-1, 240, 10, CL_GREEN);
                     g->setTextColor(CL_BLACK, CL_GREEN); }
+    else if (!e.hasPass) g->setTextColor(CL_GREY, CL_BLACK);
     else g->setTextColor(e.inProgress ? CL_GREEN : CL_WHITE, CL_BLACK);
-    String when = e.inProgress ? String("NOW") : fmtCountdown((long)(e.aos - now));
-    long lenMin = (e.los - e.aos) / 60;
     g->setCursor(4, y);
-    g->printf("%-6s %-13.13s %3.0f %2ldm", when.c_str(), e.name, e.maxEl, lenMin);
+    if (e.hasPass) {
+      String when = e.inProgress ? String("NOW") : fmtCountdown((long)(e.aos - now));
+      long lenMin = (e.los - e.aos) / 60;
+      g->printf("%-6s %-13.13s %3.0f %2ldm", when.c_str(), e.name, e.maxEl, lenMin);
+    } else {
+      g->printf("%-6s %-13.13s   -   -", "--", e.name);  // no upcoming pass / GP missing
+    }
     int idx = db.indexOfNorad(e.norad);
     if (idx >= 0 && gpAgeDays(db.at(idx)) >= 14) {
       g->setTextColor(CL_RED, isActive ? CL_GREEN : CL_BLACK);
-      g->setCursor(232, y); g->print("!");
+      g->setCursor(226, y); g->print("!");
     }
   }
-  footer("KEY1 screen  KEY2 next sat");
+
+  // Scrollbar + position indicator when the list is longer than the window.
+  if (schedN > VIS) {
+    const int x = 236, y0 = 28, h = VIS * 10;     // track
+    g->drawRect(x, y0, 3, h, CL_GREY);
+    int thumbH = (h * VIS) / schedN; if (thumbH < 4) thumbH = 4;
+    int thumbY = y0 + (h - thumbH) * top / (schedN - VIS);
+    g->fillRect(x, thumbY, 3, thumbH, CL_CYAN);
+    // "n/N" position of the active satellite, shown in the footer line.
+    char pos[12]; snprintf(pos, sizeof(pos), "%d/%d", activeRow + 1, schedN);
+    g->setTextColor(CL_CYAN, CL_BLACK);
+    g->setCursor(208, 127); g->print(pos);
+  }
+
+  footer("KEY1 scrn KEY2 sat");
 }
 
 // ---- shared polar grid + arc (verbatim from CardSat) ----------------------

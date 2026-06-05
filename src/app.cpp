@@ -224,19 +224,29 @@ void App::buildSchedule() {
   time_t now = nowUtc();
   pred.setSite(loc.obs());
 
+  // One row per selected favorite -- we never skip a satellite. If no upcoming
+  // pass can be found (or its GP is missing), it still gets a row with
+  // hasPass=false so all selected sats are always visible/scrollable.
   for (int i = 0; i < favN && schedN < SCHED_MAX; ++i) {
-    int idx = db.indexOfNorad(favs[i]);
-    if (idx < 0) continue;
-    SatEntry& s = db.at(idx);
-    if (!pred.setSat(s)) continue;
-
     SchedEntry e;
-    e.norad = s.norad;
+    e.norad = favs[i];
+
+    int idx = db.indexOfNorad(favs[i]);
+    if (idx < 0) {
+      // Favorite not present in the GP catalog (e.g. dropped from the bulletin).
+      snprintf(e.name, sizeof(e.name), "NORAD %lu", (unsigned long)favs[i]);
+      e.hasPass = false;
+      sched[schedN++] = e;
+      continue;
+    }
+    SatEntry& s = db.at(idx);
     strncpy(e.name, s.name, sizeof(e.name) - 1); e.name[sizeof(e.name) - 1] = 0;
+
+    if (!pred.setSat(s)) { e.hasPass = false; sched[schedN++] = e; continue; }
 
     LiveLook L = pred.look(now);
     if (L.el >= 0.0) {
-      e.inProgress = true; e.aos = now; e.maxEl = (float)L.el;
+      e.hasPass = true; e.inProgress = true; e.aos = now; e.maxEl = (float)L.el;
       time_t t = now, los = now;
       for (int k = 0; k < 120; ++k) {            // up to 60 min, 30 s steps
         t += 30; LiveLook l2 = pred.look(t);
@@ -247,22 +257,30 @@ void App::buildSchedule() {
       e.los = los;
     } else {
       PassPredict p;
-      if (pred.predictPasses(now, cfg.minPassEl, &p, 1) < 1) continue;
-      e.inProgress = false; e.aos = p.aos; e.los = p.los; e.maxEl = p.maxEl;
+      if (pred.predictPasses(now, cfg.minPassEl, &p, 1) >= 1) {
+        e.hasPass = true; e.inProgress = false;
+        e.aos = p.aos; e.los = p.los; e.maxEl = p.maxEl;
+      } else {
+        e.hasPass = false;                       // no pass found -> keep, show last
+      }
     }
     sched[schedN++] = e;
   }
 
-  // Insertion sort by AOS.
+  // Sort by AOS, but push the no-pass entries to the bottom (treat them as
+  // "infinitely far"). Insertion sort on a composite key.
+  auto keyOf = [](const SchedEntry& e) -> time_t {
+    return e.hasPass ? e.aos : (time_t)0x7FFFFFFFFFFFFFFFLL;
+  };
   for (int i = 1; i < schedN; ++i) {
-    SchedEntry key = sched[i]; int j = i - 1;
-    while (j >= 0 && sched[j].aos > key.aos) { sched[j+1] = sched[j]; --j; }
+    SchedEntry key = sched[i]; time_t kk = keyOf(key); int j = i - 1;
+    while (j >= 0 && keyOf(sched[j]) > kk) { sched[j+1] = sched[j]; --j; }
     sched[j+1] = key;
   }
 
   // Soonest *future* AOS feeds the alarm.
   for (int i = 0; i < schedN; ++i) {
-    if (!sched[i].inProgress && sched[i].aos > now) {
+    if (sched[i].hasPass && !sched[i].inProgress && sched[i].aos > now) {
       nextAos = sched[i].aos;
       strncpy(nextAosName, sched[i].name, sizeof(nextAosName) - 1);
       nextAosName[sizeof(nextAosName) - 1] = 0;
@@ -639,11 +657,16 @@ void App::drawPasses() {
     bool isActive = (e.norad == activeNorad);
     if (isActive) { g->fillRect(0, y-1, 240, 10, CL_GREEN);
                     g->setTextColor(CL_BLACK, CL_GREEN); }
+    else if (!e.hasPass) g->setTextColor(CL_GREY, CL_BLACK);
     else g->setTextColor(e.inProgress ? CL_GREEN : CL_WHITE, CL_BLACK);
-    String when = e.inProgress ? String("NOW") : fmtCountdown((long)(e.aos - now));
-    long lenMin = (e.los - e.aos) / 60;
     g->setCursor(4, y);
-    g->printf("%-6s %-13.13s %3.0f %2ldm", when.c_str(), e.name, e.maxEl, lenMin);
+    if (e.hasPass) {
+      String when = e.inProgress ? String("NOW") : fmtCountdown((long)(e.aos - now));
+      long lenMin = (e.los - e.aos) / 60;
+      g->printf("%-6s %-13.13s %3.0f %2ldm", when.c_str(), e.name, e.maxEl, lenMin);
+    } else {
+      g->printf("%-6s %-13.13s   -   -", "--", e.name);  // no upcoming pass / GP missing
+    }
     int idx = db.indexOfNorad(e.norad);
     if (idx >= 0 && gpAgeDays(db.at(idx)) >= 14) {
       g->setTextColor(CL_RED, isActive ? CL_GREEN : CL_BLACK);
