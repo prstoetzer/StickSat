@@ -20,6 +20,7 @@
 #include "net.h"
 #include "location.h"
 #include "predict.h"
+#include "gps.h"
 
 enum Screen : uint8_t { SCR_PASSES = 0, SCR_POLAR, SCR_TRACK, SCR_COUNT };
 
@@ -47,6 +48,10 @@ private:
   Net       net;
   Location  loc;
   Predictor pred;
+  Gps       gps;
+  bool      gpsTimeApplied = false;   // set clock from GPS once per boot
+  bool      gpsLocApplied  = false;   // set location from GPS once we have a fix
+  uint32_t  lastGpsPollMs  = 0;
 
   // UI state
   Screen   screen = SCR_PASSES;
@@ -96,9 +101,10 @@ private:
   void buildPolarPath();                   // sample current/next pass for polar
   void refreshScheduleIfNeeded();
   void serviceAosAlarm();
+  void serviceGps();                       // poll GPS; apply time/location on fix
   void sleepUntilNextPass();               // deep-sleep until ~60 s before AOS
   void reenterSetup();                     // KEY2 long-press: re-open setup portal
-  bool manualTimeEntry();                  // tilt+button UTC clock setter (no WiFi)
+  bool manualTimeEntry();                  // button-only UTC clock setter (no WiFi)
   void drawPolarGrid(int cx, int cy, int R);
   void drawPolarArc(int cx, int cy, int R, const float* az, const float* el, int n);
 

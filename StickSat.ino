@@ -75,6 +75,19 @@ static constexpr uint32_t BTN_LONG_MS    = 700;  // hold this long = long-press
 static constexpr uint8_t  BTN_WAKE_LEVEL = 0;    // active-low: wakes on LOW
 
 // ---------------------------------------------------------------------------
+//  GPS (optional) -- M5Stack Unit GPS v1.1 on the Grove port (PORT.CUSTOM)
+// ---------------------------------------------------------------------------
+//  StickC Plus Grove: yellow=G32, white=G33.  GPS unit: yellow=UART_RX,
+//  white=UART_TX.  Straight Grove cable => the Stick receives the unit's TX on
+//  G33 and sends to the unit's RX on G32. So the ESP32 UART uses RX=33, TX=32.
+//  The unit defaults to 115200 8N1, NMEA 0183. This is OPTIONAL hardware: if
+//  nothing is connected, no fix is ever obtained and nothing is shown.
+// ---------------------------------------------------------------------------
+static constexpr int      GPS_RX_PIN = 33;   // ESP32 RX  <- GPS TX (white/G33)
+static constexpr int      GPS_TX_PIN = 32;   // ESP32 TX  -> GPS RX (yellow/G32)
+static constexpr uint32_t GPS_BAUD   = 115200;
+
+// ---------------------------------------------------------------------------
 //  Limits  (kept modest for the PICO-D4's RAM / 4 MB flash)
 // ---------------------------------------------------------------------------
 static constexpr int   MAX_SATS        = 160;  // sats held in RAM from GP data
@@ -307,6 +320,52 @@ private:
   char   _name[26], _l1[72], _l2[72];
 };
 
+// ====== gps.h ======
+// ===========================================================================
+//  gps.h  -  M5Stack Unit GPS v1.1 (ATGM336H/AT6668) on the Grove port
+// ===========================================================================
+//  The StickC Plus Grove (HY2.0-4P, PORT.CUSTOM) maps: yellow=G32, white=G33.
+//  The GPS unit maps: yellow=UART_RX, white=UART_TX. With a straight Grove
+//  cable the Stick therefore RECEIVES GPS data on G33 (the unit's TX) and would
+//  transmit to the unit on G32. So we open a UART with RX=33, TX=32 at the
+//  unit's default 115200 8N1 and parse NMEA 0183.
+//
+//  This is optional hardware: if nothing is plugged in, no bytes arrive, no fix
+//  is ever reported, and (per the requirement) nothing is shown to the user.
+//  A self-contained minimal NMEA parser (RMC + GGA) avoids pulling in an extra
+//  library and matches the streaming style used elsewhere.
+
+class Gps {
+public:
+  void begin();                 // start the UART on the Grove port
+  void update();                // feed available bytes into the NMEA parser
+
+  bool   hasFix() const  { return _hasFix; }
+  bool   timeValid() const { return _timeValid; }   // RMC date+time parsed
+  time_t utc() const     { return _utc; }           // last parsed UTC (unix s)
+  double lat() const     { return _lat; }           // degrees +N
+  double lon() const     { return _lon; }           // degrees +E
+  double altM() const    { return _altM; }          // metres (GGA)
+  int    sats() const    { return _sats; }          // satellites in use (GGA)
+  uint32_t lastByteMs() const { return _lastByteMs; } // for "GPS present" hint
+
+private:
+  void parseLine(char* s);
+  void parseRmc(char* s);
+  void parseGga(char* s);
+
+  char     _buf[100];
+  uint8_t  _len = 0;
+  bool     _hasFix = false;
+  bool     _timeValid = false;
+  time_t   _utc = 0;
+  double   _lat = 0, _lon = 0, _altM = 0;
+  int      _sats = 0;
+  uint32_t _lastByteMs = 0;
+  // most-recent date (from RMC) so a time-only sentence can still build a stamp
+  int      _yy = 0, _mo = 0, _dd = 0;
+};
+
 // ====== settings.h ======
 // ===========================================================================
 //  settings.h  -  persistent user configuration (LittleFS JSON)
@@ -415,6 +474,7 @@ namespace Keys {
   // press re-opens the setup web portal (change satellites / location).
   bool key2Clicked();   // side key pressed
   bool key2Held();      // side key held past the long-press threshold
+  bool key2Down();      // raw: side key currently held down (for auto-repeat)
 
   // The RTC-capable GPIO behind KEY1, for configuring ext0 wake from deep
   // sleep (so a press of the front key wakes the device).
@@ -502,6 +562,10 @@ private:
   Net       net;
   Location  loc;
   Predictor pred;
+  Gps       gps;
+  bool      gpsTimeApplied = false;   // set clock from GPS once per boot
+  bool      gpsLocApplied  = false;   // set location from GPS once we have a fix
+  uint32_t  lastGpsPollMs  = 0;
 
   // UI state
   Screen   screen = SCR_PASSES;
@@ -551,9 +615,10 @@ private:
   void buildPolarPath();                   // sample current/next pass for polar
   void refreshScheduleIfNeeded();
   void serviceAosAlarm();
+  void serviceGps();                       // poll GPS; apply time/location on fix
   void sleepUntilNextPass();               // deep-sleep until ~60 s before AOS
   void reenterSetup();                     // KEY2 long-press: re-open setup portal
-  bool manualTimeEntry();                  // tilt+button UTC clock setter (no WiFi)
+  bool manualTimeEntry();                  // button-only UTC clock setter (no WiFi)
   void drawPolarGrid(int cx, int cy, int R);
   void drawPolarArc(int cx, int cy, int R, const float* az, const float* el, int n);
 
@@ -1358,6 +1423,151 @@ int Predictor::predictPasses(time_t from, float minEl, PassPredict* out, int max
   return found;
 }
 
+// ====== gps.cpp ======
+// ===========================================================================
+//  gps.cpp  -  minimal NMEA 0183 parser for the M5Stack Unit GPS v1.1
+// ===========================================================================
+
+// UART2 on the Grove port. RX=33 (reads the unit's TX), TX=32 (to the unit's RX).
+static HardwareSerial GpsSerial(2);
+
+void Gps::begin() {
+  GpsSerial.begin(GPS_BAUD, SERIAL_8N1, GPS_RX_PIN, GPS_TX_PIN);
+  _len = 0;
+  Serial.printf("[gps] UART2 @%d  RX=G%d TX=G%d (optional)\n",
+                GPS_BAUD, GPS_RX_PIN, GPS_TX_PIN);
+}
+
+void Gps::update() {
+  // Drain whatever is available; assemble complete NMEA lines and parse them.
+  while (GpsSerial.available()) {
+    char c = (char)GpsSerial.read();
+    _lastByteMs = millis();
+    if (c == '\r') continue;
+    if (c == '\n') {
+      _buf[_len] = 0;
+      if (_len > 6) parseLine(_buf);
+      _len = 0;
+    } else if (_len < sizeof(_buf) - 1) {
+      _buf[_len++] = c;
+    } else {
+      _len = 0;                 // overrun -> resync on next line
+    }
+  }
+}
+
+// Verify the optional "*hh" NMEA checksum if present; tolerate its absence.
+static bool nmeaChecksumOk(const char* s) {
+  if (s[0] != '$') return false;
+  const char* star = strchr(s, '*');
+  if (!star) return true;                       // no checksum field -> accept
+  uint8_t sum = 0;
+  for (const char* p = s + 1; p < star; ++p) sum ^= (uint8_t)*p;
+  uint8_t want = (uint8_t)strtol(star + 1, nullptr, 16);
+  return sum == want;
+}
+
+void Gps::parseLine(char* s) {
+  if (!nmeaChecksumOk(s)) return;
+  // Talker id varies (GP/GN/GL/...); match the sentence type after 3 chars.
+  // e.g. "$GPRMC", "$GNRMC", "$GPGGA", "$GNGGA".
+  if (strlen(s) < 6) return;
+  const char* type = s + 3;                     // skip "$Gx"
+  if (!strncmp(type, "RMC", 3)) parseRmc(s);
+  else if (!strncmp(type, "GGA", 3)) parseGga(s);
+}
+
+// Split helper: returns pointer to field n (0-based) within the comma-delimited
+// sentence, modifying the buffer in place (NUL-terminating fields).
+static char* field(char* s, int n) {
+  int i = 0;
+  char* p = s;
+  while (*p && i < n) { if (*p == ',') i++; p++; if (i == n) break; }
+  if (i != n) return nullptr;
+  // terminate this field at the next comma or '*'
+  char* e = p;
+  while (*e && *e != ',' && *e != '*') e++;
+  *e = 0;
+  return p;
+}
+
+// $GxRMC,hhmmss.ss,A,llll.lll,N,yyyyy.yyy,E,spd,crs,ddmmyy,...
+void Gps::parseRmc(char* s) {
+  // Work on a copy so the in-place field splitting doesn't clobber later parses.
+  char tmp[100]; strncpy(tmp, s, sizeof(tmp) - 1); tmp[sizeof(tmp) - 1] = 0;
+
+  char* tField = field(tmp, 1);
+  strncpy(tmp, s, sizeof(tmp) - 1); tmp[sizeof(tmp) - 1] = 0;
+  char* status = field(tmp, 2);
+  strncpy(tmp, s, sizeof(tmp) - 1); tmp[sizeof(tmp) - 1] = 0;
+  char* latF = field(tmp, 3);
+  strncpy(tmp, s, sizeof(tmp) - 1); tmp[sizeof(tmp) - 1] = 0;
+  char* ns = field(tmp, 4);
+  strncpy(tmp, s, sizeof(tmp) - 1); tmp[sizeof(tmp) - 1] = 0;
+  char* lonF = field(tmp, 5);
+  strncpy(tmp, s, sizeof(tmp) - 1); tmp[sizeof(tmp) - 1] = 0;
+  char* ew = field(tmp, 6);
+  strncpy(tmp, s, sizeof(tmp) - 1); tmp[sizeof(tmp) - 1] = 0;
+  char* dField = field(tmp, 9);
+
+  bool active = (status && status[0] == 'A');
+
+  // Time hhmmss(.sss) + date ddmmyy -> unix UTC.
+  int hh = 0, mi = 0, sec = 0;
+  if (tField && strlen(tField) >= 6) {
+    hh  = (tField[0]-'0')*10 + (tField[1]-'0');
+    mi  = (tField[2]-'0')*10 + (tField[3]-'0');
+    sec = (tField[4]-'0')*10 + (tField[5]-'0');
+  }
+  if (dField && strlen(dField) >= 6) {
+    _dd = (dField[0]-'0')*10 + (dField[1]-'0');
+    _mo = (dField[2]-'0')*10 + (dField[3]-'0');
+    _yy = 2000 + (dField[4]-'0')*10 + (dField[5]-'0');
+  }
+  if (_yy >= 2000 && tField && strlen(tField) >= 6) {
+    // Civil UTC -> unix (Howard Hinnant), no timegm dependency.
+    int Y = _yy, Mo = _mo, D = _dd;
+    int yy = Y - (Mo <= 2);
+    long era = (yy >= 0 ? yy : yy - 399) / 400;
+    unsigned yoe = (unsigned)(yy - era * 400);
+    unsigned doy = (153 * (Mo + (Mo > 2 ? -3 : 9)) + 2) / 5 + D - 1;
+    unsigned doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    long days = era * 146097 + (long)doe - 719468;
+    _utc = (time_t)days * 86400 + hh * 3600 + mi * 60 + sec;
+    _timeValid = true;
+  }
+
+  if (active && latF && lonF && latF[0] && lonF[0]) {
+    // ddmm.mmmm -> degrees.
+    double rawLat = atof(latF), rawLon = atof(lonF);
+    int latDeg = (int)(rawLat / 100);
+    int lonDeg = (int)(rawLon / 100);
+    double lat = latDeg + (rawLat - latDeg * 100) / 60.0;
+    double lon = lonDeg + (rawLon - lonDeg * 100) / 60.0;
+    if (ns && ns[0] == 'S') lat = -lat;
+    if (ew && ew[0] == 'W') lon = -lon;
+    _lat = lat; _lon = lon;
+    _hasFix = true;
+  } else if (!active) {
+    _hasFix = false;
+  }
+}
+
+// $GxGGA,hhmmss.ss,llll.lll,N,yyyyy.yyy,E,fix,sats,hdop,alt,M,...
+void Gps::parseGga(char* s) {
+  char tmp[100];
+  strncpy(tmp, s, sizeof(tmp) - 1); tmp[sizeof(tmp) - 1] = 0;
+  char* fixF = field(tmp, 6);
+  strncpy(tmp, s, sizeof(tmp) - 1); tmp[sizeof(tmp) - 1] = 0;
+  char* satF = field(tmp, 7);
+  strncpy(tmp, s, sizeof(tmp) - 1); tmp[sizeof(tmp) - 1] = 0;
+  char* altF = field(tmp, 9);
+
+  if (satF && satF[0]) _sats = atoi(satF);
+  if (altF && altF[0]) _altM = atof(altF);
+  if (fixF && fixF[0]) { int q = atoi(fixF); if (q >= 1) _hasFix = true; }
+}
+
 // ====== settings.cpp ======
 // ===========================================================================
 //  settings.cpp
@@ -1634,6 +1844,9 @@ bool key2Clicked() { return M5.BtnB.wasClicked(); }
 
 // KEY2 long press: held past the threshold -> re-open setup.
 bool key2Held() { return M5.BtnB.wasHold(); }
+
+// KEY2 raw state: is the side key physically down right now? (for auto-repeat)
+bool key2Down() { return M5.BtnB.isPressed(); }
 
 int wakePin() { return s_wakePin; }
 
@@ -2201,6 +2414,10 @@ void App::setup() {
   if (favN && timeIsSet()) buildSchedule();
   onActiveSatChanged();
 
+  // Start the optional Grove GPS. Harmless if nothing is connected: no bytes
+  // arrive, no fix is ever reported, and nothing is shown to the user.
+  gps.begin();
+
   // Woke from the deep-sleep-until-pass timer? Land on Next Passes so the
   // imminent pass is front and centre (the AOS alarm sounds shortly after).
   if (esp_sleep_get_wakeup_cause() == ESP_SLEEP_WAKEUP_TIMER) {
@@ -2379,9 +2596,52 @@ void App::serviceAosAlarm() {
   }
 }
 
+// ---- optional Grove GPS: poll NMEA; apply time + location on first fix ------
+//  Silent if no unit is attached (no bytes -> no fix -> nothing happens, and
+//  nothing is drawn). GPS time is accurate, so we use it to set the clock once
+//  per boot (preferred over a drifted RTC); location is applied once we get a
+//  position fix, then persisted so it survives without GPS afterward.
+void App::serviceGps() {
+  gps.update();                              // cheap UART drain + NMEA parse
+
+  uint32_t ms = millis();
+  if (ms - lastGpsPollMs < 1000) return;     // act on changes at most ~1 Hz
+  lastGpsPollMs = ms;
+
+  // ---- Time: set the clock from GPS UTC once we have a valid date+time ----
+  if (!gpsTimeApplied && gps.timeValid()) {
+    time_t t = gps.utc();
+    if (t > 1700000000) {                    // sane (> 2023)
+      struct timeval tv = { t, 0 };
+      settimeofday(&tv, nullptr);
+      s_rtcAnchorWall  = (uint64_t)t;
+      s_rtcAnchorMono  = (uint64_t)esp_timer_get_time();
+      s_rtcAnchorValid = true;
+      gpsTimeApplied = true;
+      setStatus("GPS time locked", 2500);
+      if (favN) buildSchedule();             // schedule now that the clock is set
+    }
+  }
+
+  // ---- Location: set + persist from the first position fix ----------------
+  if (!gpsLocApplied && gps.hasFix()) {
+    double la = gps.lat(), lo = gps.lon(), al = gps.altM();
+    if (la != 0.0 || lo != 0.0) {
+      loc.setManual(la, lo, al);
+      pred.setSite(loc.obs());
+      cfg.lat = la; cfg.lon = lo; cfg.altM = al; cfg.save();
+      gpsLocApplied = true;
+      setStatus("GPS location locked", 2500);
+      if (favN && timeIsSet()) buildSchedule();
+      onActiveSatChanged();
+    }
+  }
+}
+
 // ---- deep-sleep until ~60 s before the next AOS; KEY1 wakes ----------------
 void App::sleepUntilNextPass() {
   if (!timeIsSet()) { setStatus("Clock not set"); }
+
   if (nextAos == 0) buildSchedule();
 
   const long lead = 60;
@@ -2422,27 +2682,11 @@ void App::sleepUntilNextPass() {
 }
 
 // ===========================================================================
-//  Manual UTC clock entry (no WiFi). Tilt the stick to change the highlighted
-//  field, KEY2 to move between fields, KEY1 to save (hold KEY1 to cancel).
-//  Returns true if the clock was set.
+//  Manual UTC clock entry (no WiFi), button-only: KEY2 increments the
+//  highlighted field (hold to auto-repeat), KEY1 moves to the next field, and
+//  a long-press of KEY1 saves. Returns true if the clock was set.
 // ===========================================================================
 bool App::manualTimeEntry() {
-  bool haveImu = M5.Imu.isEnabled();
-  if (!haveImu) {
-    // Without the IMU there's no analog input for the value; warn but still let
-    // the user back out cleanly. (All M5StickC Plus 1.1 units have an MPU6886,
-    // so this is just defensive.)
-    g->fillScreen(CL_BLACK);
-    header("Set UTC");
-    g->setTextSize(1);
-    g->setTextColor(CL_ORANGE, CL_BLACK);
-    g->setCursor(6, 40); g->print("IMU not available.");
-    g->setTextColor(CL_GREY, CL_BLACK);
-    g->setCursor(6, 56); g->print("Press KEY1 to go back.");
-    flush();
-    for (;;) { M5.update(); if (Keys::key1Clicked() || Keys::key1Held()) return false; delay(10); }
-  }
-
   // Seed from the current clock if valid, else a neutral default.
   struct tm tmv;
   time_t seed = timeIsSet() ? nowUtc() : 1735689600;  // 2025-01-01 00:00:00Z
@@ -2458,35 +2702,34 @@ bool App::manualTimeEntry() {
   int field = 0;                          // 0=Y 1=Mo 2=D 3=h 4=mi 5=se
   const char* labels[NF] = {"Year","Month","Day","Hour","Min","Sec"};
 
-  // Tilt input state: pitch from accel X (long axis). Past a threshold steps the
-  // value; holding the tilt auto-repeats with acceleration. Returning near
-  // level re-arms a fresh single step.
-  uint32_t lastStep = 0;
-  int      repeatN  = 0;
-
   auto daysInMonth = [](int y, int m) -> int {
     static const int d[] = {31,28,31,30,31,30,31,31,30,31,30,31};
     if (m == 2 && ((y % 4 == 0 && y % 100 != 0) || y % 400 == 0)) return 29;
     return d[(m - 1) % 12];
   };
   auto clampDay = [&]() { int dim = daysInMonth(Y, Mo); if (D > dim) D = dim; if (D < 1) D = 1; };
-  auto step = [&](int dir) {
+  auto inc = [&]() {                                    // increment current field (wraps)
     switch (field) {
-      case 0: Y  += dir; if (Y < 2020) Y = 2020; if (Y > 2099) Y = 2099; clampDay(); break;
-      case 1: Mo += dir; if (Mo < 1) Mo = 12; if (Mo > 12) Mo = 1; clampDay(); break;
-      case 2: { int dim = daysInMonth(Y, Mo); D += dir; if (D < 1) D = dim; if (D > dim) D = 1; } break;
-      case 3: h  += dir; if (h < 0) h = 23; if (h > 23) h = 0; break;
-      case 4: mi += dir; if (mi < 0) mi = 59; if (mi > 59) mi = 0; break;
-      case 5: se += dir; if (se < 0) se = 59; if (se > 59) se = 0; break;
+      case 0: Y++;  if (Y > 2099) Y = 2020; clampDay(); break;
+      case 1: Mo++; if (Mo > 12) Mo = 1;    clampDay(); break;
+      case 2: { int dim = daysInMonth(Y, Mo); D++; if (D > dim) D = 1; } break;
+      case 3: h++;  if (h > 23) h = 0;  break;
+      case 4: mi++; if (mi > 59) mi = 0; break;
+      case 5: se++; if (se > 59) se = 0; break;
     }
   };
+
+  // Button-only editor:
+  //   KEY2 short  -> increment the highlighted field (wraps)
+  //   KEY2 hold   -> auto-repeat increment (fast scroll; accelerates)
+  //   KEY1 short  -> move to the next field
+  //   KEY1 hold   -> save & exit
+  uint32_t repStart = 0, lastRep = 0; int repN = 0;
 
   for (;;) {
     M5.update();
 
-    // ---- Buttons ----
-    if (Keys::key1Held()) return false;                 // cancel
-    if (Keys::key1Clicked()) {                           // save
+    if (Keys::key1Held()) {                              // save
       // Civil UTC -> unix seconds (Howard Hinnant's algorithm), no timegm()
       // dependency and no reliance on the process timezone.
       int yy = Y - (Mo <= 2);
@@ -2505,24 +2748,19 @@ bool App::manualTimeEntry() {
       setStatus("Clock set", 2500);
       return true;
     }
-    if (Keys::key2Clicked()) { field = (field + 1) % NF; }
+    if (Keys::key1Clicked()) { field = (field + 1) % NF; }  // next field
 
-    // ---- Tilt (accel X = long axis with rotation 1) ----
-    float ax = 0, ay = 0, az = 0;
-    M5.Imu.getAccelData(&ax, &ay, &az);
-    // ax ~ 0 level, ~ +/-0.5..1.0 g when tilted along the long axis.
-    const float TH = 0.30f;                              // tilt threshold (g)
-    uint32_t now = millis();
-    if (fabsf(ax) > TH) {
-      // Auto-repeat: first step immediate, then accelerate while held.
-      uint32_t interval = (repeatN < 3) ? 320 : (repeatN < 8 ? 150 : 60);
-      if (now - lastStep >= interval) {
-        step(ax > 0 ? +1 : -1);
-        lastStep = now;
-        if (repeatN < 100) repeatN++;
+    // KEY2: single click increments; holding it auto-repeats (accelerating).
+    if (Keys::key2Clicked()) { inc(); repStart = millis(); lastRep = millis(); repN = 0; }
+    if (Keys::key2Down()) {
+      uint32_t now = millis();
+      if (repStart == 0) repStart = now;
+      if (now - repStart > 500) {                        // begin repeat after 0.5 s hold
+        uint32_t interval = (repN < 6) ? 160 : (repN < 16 ? 70 : 30);
+        if (now - lastRep >= interval) { inc(); lastRep = now; if (repN < 100) repN++; }
       }
     } else {
-      repeatN = 0; lastStep = 0;                         // re-arm when level
+      repStart = 0; repN = 0;                            // released -> re-arm
     }
 
     // ---- Draw ----
@@ -2530,7 +2768,7 @@ bool App::manualTimeEntry() {
     header("Set UTC");
     g->setTextSize(1);
     g->setTextColor(CL_GREY, CL_BLACK);
-    g->setCursor(4, 20); g->print("Tilt to change, KEY2 next");
+    g->setCursor(4, 20); g->print("KEY2 change  KEY1 next");
 
     char buf[20];
     snprintf(buf, sizeof(buf), "%04d-%02d-%02d", Y, Mo, D);
@@ -2539,10 +2777,9 @@ bool App::manualTimeEntry() {
     snprintf(buf, sizeof(buf), "%02d:%02d:%02d UTC", h, mi, se);
     g->setCursor(8, 64);  g->print(buf);
 
-    // Underline the active field.
-    // date row x-origins (size-2 font = 12px/char): Y@8 Mo@8+5*12 D@8+8*12
+    // Underline the active field (size-2 font = 12px/char).
     struct { int x, w; } pos[NF] = {
-      {8, 48}, {8 + 5*12, 24}, {8 + 8*12, 24},     // Y, Mo, D  (row y=38, h=16)
+      {8, 48}, {8 + 5*12, 24}, {8 + 8*12, 24},     // Y, Mo, D  (row y=38)
       {8, 24}, {8 + 3*12, 24}, {8 + 6*12, 24}      // h, mi, se (row y=64)
     };
     int uy = (field < 3) ? 56 : 82;
@@ -2551,7 +2788,7 @@ bool App::manualTimeEntry() {
     g->setTextColor(CL_GREEN, CL_BLACK);
     g->setCursor(4, 92); g->printf("field: %s", labels[field]);
     g->setTextColor(CL_GREY, CL_BLACK);
-    g->setCursor(4, 104); g->print("KEY1 save  (hold=cancel)");
+    g->setCursor(4, 104); g->print("hold KEY1 to save");
     flush();
 
     delay(20);
@@ -2561,7 +2798,7 @@ bool App::manualTimeEntry() {
 // ===========================================================================
 //  Re-open setup (KEY2 long-press): choose WiFi setup portal or manual clock.
 //  The WiFi path tries saved creds, then the captive portal; on finish it
-//  re-caches transponders. The manual-clock path sets UTC offline via tilt.
+//  re-caches transponders. The manual-clock path sets UTC offline via buttons.
 // ===========================================================================
 void App::reenterSetup() {
   // Chooser: long-press KEY2 lands here. Offer the WiFi setup portal (KEY1) or
@@ -2576,7 +2813,7 @@ void App::reenterSetup() {
     g->setCursor(6, 26); g->print("KEY1: WiFi setup");
     g->setCursor(16, 38); g->print("(location & satellites)");
     g->setCursor(6, 58); g->print("KEY2: Set clock manually");
-    g->setCursor(16, 70); g->print("(tilt to adjust, no WiFi)");
+    g->setCursor(16, 70); g->print("(buttons, no WiFi)");
     g->setTextColor(CL_GREY, CL_BLACK);
     g->setCursor(6, 96); g->print("hold KEY1 to cancel");
     flush();
@@ -2697,6 +2934,7 @@ void App::loop() {
 
   handleKeys();
 
+  serviceGps();
   refreshScheduleIfNeeded();
   serviceAosAlarm();
 
@@ -2782,17 +3020,24 @@ void App::header(const String& t) {
 
   // Offline indicator: a red "NW" (no-WiFi) tag left of the battery whenever we
   // are not connected, so every screen shows the warning. Reserve its slot so
-  // the clock doesn't overlap it.
+  // the clock doesn't overlap it. A green "G" appears in its place when a GPS
+  // fix is active (GPS makes the missing WiFi a non-issue for time/location).
   bool online = net.connected();
+  bool gpsFix = gps.hasFix();
   const int nwW = 16;                       // width reserved for the tag
   int nwRight = bx - 4;                      // right edge of the indicator zone
-  if (!online) {
+  if (gpsFix) {
+    g->setTextColor(CL_GREEN, CL_BLUE);
+    g->setTextSize(1);
+    g->setCursor(nwRight - nwW + 4, 4);
+    g->print("G");                           // GPS fix
+  } else if (!online) {
     g->setTextColor(CL_RED, CL_BLUE);
     g->setTextSize(1);
     g->setCursor(nwRight - nwW + 2, 4);
     g->print("NW");                          // "No WiFi"
   }
-  int clkRight = online ? bx : (nwRight - nwW); // clock ends before NW tag if offline
+  int clkRight = (online || gpsFix) ? bx : (nwRight - nwW); // clock end
 
   // Clock left of the battery / offline tag.
   String clk; int rightLimit = clkRight;

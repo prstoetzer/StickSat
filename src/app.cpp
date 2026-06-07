@@ -189,6 +189,10 @@ void App::setup() {
   if (favN && timeIsSet()) buildSchedule();
   onActiveSatChanged();
 
+  // Start the optional Grove GPS. Harmless if nothing is connected: no bytes
+  // arrive, no fix is ever reported, and nothing is shown to the user.
+  gps.begin();
+
   // Woke from the deep-sleep-until-pass timer? Land on Next Passes so the
   // imminent pass is front and centre (the AOS alarm sounds shortly after).
   if (esp_sleep_get_wakeup_cause() == ESP_SLEEP_WAKEUP_TIMER) {
@@ -367,9 +371,52 @@ void App::serviceAosAlarm() {
   }
 }
 
+// ---- optional Grove GPS: poll NMEA; apply time + location on first fix ------
+//  Silent if no unit is attached (no bytes -> no fix -> nothing happens, and
+//  nothing is drawn). GPS time is accurate, so we use it to set the clock once
+//  per boot (preferred over a drifted RTC); location is applied once we get a
+//  position fix, then persisted so it survives without GPS afterward.
+void App::serviceGps() {
+  gps.update();                              // cheap UART drain + NMEA parse
+
+  uint32_t ms = millis();
+  if (ms - lastGpsPollMs < 1000) return;     // act on changes at most ~1 Hz
+  lastGpsPollMs = ms;
+
+  // ---- Time: set the clock from GPS UTC once we have a valid date+time ----
+  if (!gpsTimeApplied && gps.timeValid()) {
+    time_t t = gps.utc();
+    if (t > 1700000000) {                    // sane (> 2023)
+      struct timeval tv = { t, 0 };
+      settimeofday(&tv, nullptr);
+      s_rtcAnchorWall  = (uint64_t)t;
+      s_rtcAnchorMono  = (uint64_t)esp_timer_get_time();
+      s_rtcAnchorValid = true;
+      gpsTimeApplied = true;
+      setStatus("GPS time locked", 2500);
+      if (favN) buildSchedule();             // schedule now that the clock is set
+    }
+  }
+
+  // ---- Location: set + persist from the first position fix ----------------
+  if (!gpsLocApplied && gps.hasFix()) {
+    double la = gps.lat(), lo = gps.lon(), al = gps.altM();
+    if (la != 0.0 || lo != 0.0) {
+      loc.setManual(la, lo, al);
+      pred.setSite(loc.obs());
+      cfg.lat = la; cfg.lon = lo; cfg.altM = al; cfg.save();
+      gpsLocApplied = true;
+      setStatus("GPS location locked", 2500);
+      if (favN && timeIsSet()) buildSchedule();
+      onActiveSatChanged();
+    }
+  }
+}
+
 // ---- deep-sleep until ~60 s before the next AOS; KEY1 wakes ----------------
 void App::sleepUntilNextPass() {
   if (!timeIsSet()) { setStatus("Clock not set"); }
+
   if (nextAos == 0) buildSchedule();
 
   const long lead = 60;
@@ -662,6 +709,7 @@ void App::loop() {
 
   handleKeys();
 
+  serviceGps();
   refreshScheduleIfNeeded();
   serviceAosAlarm();
 
@@ -747,17 +795,24 @@ void App::header(const String& t) {
 
   // Offline indicator: a red "NW" (no-WiFi) tag left of the battery whenever we
   // are not connected, so every screen shows the warning. Reserve its slot so
-  // the clock doesn't overlap it.
+  // the clock doesn't overlap it. A green "G" appears in its place when a GPS
+  // fix is active (GPS makes the missing WiFi a non-issue for time/location).
   bool online = net.connected();
+  bool gpsFix = gps.hasFix();
   const int nwW = 16;                       // width reserved for the tag
   int nwRight = bx - 4;                      // right edge of the indicator zone
-  if (!online) {
+  if (gpsFix) {
+    g->setTextColor(CL_GREEN, CL_BLUE);
+    g->setTextSize(1);
+    g->setCursor(nwRight - nwW + 4, 4);
+    g->print("G");                           // GPS fix
+  } else if (!online) {
     g->setTextColor(CL_RED, CL_BLUE);
     g->setTextSize(1);
     g->setCursor(nwRight - nwW + 2, 4);
     g->print("NW");                          // "No WiFi"
   }
-  int clkRight = online ? bx : (nwRight - nwW); // clock ends before NW tag if offline
+  int clkRight = (online || gpsFix) ? bx : (nwRight - nwW); // clock end
 
   // Clock left of the battery / offline tag.
   String clk; int rightLimit = clkRight;

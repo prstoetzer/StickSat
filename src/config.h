@@ -56,6 +56,19 @@ static constexpr uint32_t BTN_LONG_MS    = 700;  // hold this long = long-press
 static constexpr uint8_t  BTN_WAKE_LEVEL = 0;    // active-low: wakes on LOW
 
 // ---------------------------------------------------------------------------
+//  GPS (optional) -- M5Stack Unit GPS v1.1 on the Grove port (PORT.CUSTOM)
+// ---------------------------------------------------------------------------
+//  StickC Plus Grove: yellow=G32, white=G33.  GPS unit: yellow=UART_RX,
+//  white=UART_TX.  Straight Grove cable => the Stick receives the unit's TX on
+//  G33 and sends to the unit's RX on G32. So the ESP32 UART uses RX=33, TX=32.
+//  The unit defaults to 115200 8N1, NMEA 0183. This is OPTIONAL hardware: if
+//  nothing is connected, no fix is ever obtained and nothing is shown.
+// ---------------------------------------------------------------------------
+static constexpr int      GPS_RX_PIN = 33;   // ESP32 RX  <- GPS TX (white/G33)
+static constexpr int      GPS_TX_PIN = 32;   // ESP32 TX  -> GPS RX (yellow/G32)
+static constexpr uint32_t GPS_BAUD   = 115200;
+
+// ---------------------------------------------------------------------------
 //  Limits  (kept modest for the PICO-D4's RAM / 4 MB flash)
 // ---------------------------------------------------------------------------
 static constexpr int   MAX_SATS        = 160;  // sats held in RAM from GP data

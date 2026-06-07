@@ -105,7 +105,18 @@ Location and satellite selection are always preserved on flash; a factory reset
 
 ---
 
-## Build & flash (PlatformIO)
+## Optional GPS (M5Stack Unit GPS v1.1)
+
+Plug an **M5Stack Unit GPS v1.1** into the Grove port and StickSat uses it
+automatically — no setup needed. At boot it opens the Grove UART (G33 RX / G32
+TX, 115200 NMEA) and, once the unit gets a fix, sets the **clock** from GPS UTC
+and the **location** from the GPS position (then saves the location to flash so
+it persists without GPS). A green **`G`** appears in the header while a fix is
+active. This is the easiest way to run fully offline: no WiFi, no manual clock
+entry. GPS is entirely optional — if nothing is connected, nothing happens and
+no error is shown.
+
+
 
 ```
 pio run                 # build
@@ -165,6 +176,7 @@ satdb.{h,cpp}       GP/OMM store + TLE rebuild + streaming parse + transponders
 net.{h,cpp}         WiFi, NTP, HTTPS GET, GP stream-to-file, SatNOGS fetch
 location.{h,cpp}    manual / grid position, Maidenhead conversion
 predict.{h,cpp}     SGP4 wrapper: look angles, passes, Doppler, Sun/eclipse, polar
+gps.{h,cpp}         optional Grove GPS (Unit GPS v1.1): NMEA time + location
 favs.{h,cpp}        the user's selected satellites (up to 20)
 buttons.{h,cpp}     KEY1 / KEY2 over M5Unified BtnA / BtnB (short + long press), wake pin
 portal.{h,cpp}      captive WiFi portal + location/satellite setup web server

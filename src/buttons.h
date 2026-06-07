@@ -35,6 +35,7 @@ namespace Keys {
   // press re-opens the setup web portal (change satellites / location).
   bool key2Clicked();   // side key pressed
   bool key2Held();      // side key held past the long-press threshold
+  bool key2Down();      // raw: side key currently held down (for auto-repeat)
 
   // The RTC-capable GPIO behind KEY1, for configuring ext0 wake from deep
   // sleep (so a press of the front key wakes the device).
