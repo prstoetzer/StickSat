@@ -2,16 +2,18 @@
 
 StickSat is a slimmed-down port of **CardSat** (the M5Cardputer-ADV amateur-radio
 satellite tracker) to the **M5StickC Plus 1.1** (ESP32-PICO-D4, 4 MB flash, no
-PSRAM, ~520 KB SRAM, 135×240 LCD, buttons A/B/C). It keeps CardSat's offline SGP4 pass
-prediction, the **Next-Passes** schedule, the **live polar plot**, a **Doppler /
-transponder readout**, the **AOS alarm**, and **deep-sleep-until-pass**. It
-**drops** everything that needs more I/O or keys than the Stick has: CAT radio
-control, the antenna rotator, GPS, per-satellite calibration, the mutual-window
-finder, and manual element entry.
+PSRAM, ~520 KB SRAM, 135×240 LCD, buttons A/B/C). It keeps CardSat's offline SGP4
+pass prediction, the **Next-Passes** schedule, the **live polar plot**, a
+**Doppler / transponder readout**, the **AOS alarm**, and
+**deep-sleep-until-pass**. It **drops** the things that need more I/O than the
+Stick has: CAT radio control, the antenna rotator, per-satellite calibration,
+the mutual-window finder, and manual TLE entry.
 
-Setup is done entirely over WiFi: a **captive portal** collects your WiFi
-credentials on first boot, then an on-device **web page** lets you set your
-location and pick up to **20 satellites** from the AMSAT distribution.
+Time and location can come from three sources, in order of convenience: an
+**optional Grove GPS** (auto-detected), **WiFi** (NTP for the clock + a web page
+for location), or **manual entry** on the device. Once set, everything is cached
+to flash so the tracker runs fully offline. You pick up to **20 satellites**
+from the AMSAT distribution during setup.
 
 ---
 
@@ -24,12 +26,17 @@ class (`M5.BtnA` = KEY1, `M5.BtnB` = KEY2). The top Button C (GPIO35) is unused.
 
 | Action | Result |
 |---|---|
-| **KEY1 short press** | Next screen. Cycles **Next Passes → Polar → Track** and wraps. |
+| **KEY1 short press** | Next screen. Cycles **Next Passes → Polar → Track → GPS** and wraps. |
 | **KEY1 long press** (≥0.7 s) | Enter **deep sleep** until ~60 s before the next AOS. |
 | **KEY1 while asleep** | **Wake** the device. |
 | **KEY2 short press** (Next Passes / Polar) | Advance to the **next satellite**; wraps at the end of your list. |
 | **KEY2 short press** (Track) | Advance to the **next transponder** of the active satellite; wraps. |
-| **KEY2 long press** (≥0.7 s, any screen) | **Re-open the setup web portal** to change your location and satellite list. |
+| **KEY2 long press** (≥0.7 s, any screen) | Open the **setup chooser** — then **KEY1** = WiFi setup (location & satellites), **KEY2** = set the clock manually (no WiFi). |
+
+On the **Next Passes** screen, when KEY2 steps past the bottom of the visible
+window the list scrolls to follow the selected satellite (a scrollbar and an
+`n/N` position indicator appear once you have more than nine), so all 20 favorites
+are reachable.
 
 ---
 
@@ -38,21 +45,29 @@ class (`M5.BtnA` = KEY1, `M5.BtnB` = KEY2). The top Button C (GPIO35) is unused.
 1. **Next Passes** *(home / first screen)* — one schedule across all your
    selected satellites, soonest AOS first, in the same layout CardSat uses:
    `When  Satellite  El  Len`, with in-progress passes shown as **NOW** and a
-   red `!` flag on stale element sets. The currently-selected satellite is
-   highlighted. This is also where a deep-sleep wake lands you.
+   red `!` flag on stale element sets. Every selected satellite gets a row (ones
+   with no upcoming pass are listed last with `--`), and the list scrolls so all
+   20 are reachable. The currently-selected satellite is highlighted. This is
+   also where a deep-sleep wake lands you.
 
 2. **Polar** — a live sky plot of the **current** pass (ground-track arc with
    AOS/LOS markers, travel-direction arrow, a live position dot and a Sun
    glyph). When the active satellite is **below the horizon**, it automatically
-   shows the **next** pass's polar track instead, with its AOS time. Right-hand
-   readout: az/el, range, range-rate, Sun az/el, and sunlit/eclipse.
+   shows the **next** pass's polar track instead. Right-hand readout: az/el,
+   range, range-rate, the pass's **AOS/LOS times** with a countdown, peak
+   elevation, and sunlit/eclipse.
 
 3. **Track** — CardSat's Doppler/transponder detail, **read-only** (no radio,
    rotator, or calibration). Shows az/el/range/range-rate, GP age, and for the
-   selected transponder the nominal **DN/UP** centre frequencies, the
-   **Doppler-corrected RX/TX** a radio would use, the mode/inversion/bandwidth,
-   any FM uplink PL tone, and the current Doppler shift in Hz. **KEY2** cycles
-   through the transponders downloaded from SatNOGS.
+   selected transponder the **DN/UP** centre frequencies (passband centre for
+   linear transponders), the **Doppler-corrected RX/TX** a radio would use, the
+   mode/inversion/bandwidth, any FM uplink PL tone, and the current Doppler
+   shift in Hz. **KEY2** cycles through the transponders downloaded from SatNOGS.
+
+4. **GPS** — status of the optional Grove GPS: fix state and satellite count,
+   **latitude / longitude**, **altitude**, the **6-digit Maidenhead grid**, and
+   **UTC date/time** from the unit. With no unit attached it says so and (if the
+   clock is set from another source) still shows current UTC.
 
 The **AOS alarm** (countdown beeps at T-60/30/10 s and a flashing AOS banner)
 and the orange T-minus strip overlay on every screen, exactly as in CardSat.
@@ -74,7 +89,9 @@ every power-on — see "Normal power-on" below.
 2. Once online, StickSat downloads the AMSAT GP element set and serves a setup
    page at the IP shown on screen. There you:
    - set your **location** (Maidenhead grid such as `FN31pr`, or decimal
-     lat/lon), and
+     lat/lon),
+   - set the **minimum pass elevation** (0° includes passes down to the
+     horizon), and
    - tick up to **20 satellites** from the AMSAT list (a live counter enforces
      the cap).
 3. Tap **Finish setup** (or hold **KEY1**) and StickSat downloads the SatNOGS
@@ -116,7 +133,26 @@ active. This is the easiest way to run fully offline: no WiFi, no manual clock
 entry. GPS is entirely optional — if nothing is connected, nothing happens and
 no error is shown.
 
+---
 
+## Setting the clock without WiFi or GPS
+
+Long-press **KEY2** → the setup chooser → **KEY2** again opens a button-only UTC
+clock editor:
+
+- **KEY2** increments the highlighted field (hold to auto-repeat, accelerating).
+- **KEY1** moves to the next field (Year → Month → Day → Hour → Min → Sec).
+- **hold KEY1** saves and exits.
+
+The clock is also **preserved across deep sleep**: StickSat stashes a time
+anchor in RTC memory before sleeping and restores it on wake, so it stays usable
+offline through sleep/wake cycles. (The ESP32's deep-sleep clock drifts on its
+internal oscillator — fine for the short sleeps StickSat uses between passes;
+for long offline stretches, a GPS or WiFi re-sync keeps it honest.)
+
+---
+
+## Build & flash (PlatformIO)
 
 ```
 pio run                 # build
@@ -126,8 +162,9 @@ pio device monitor      # 115200 baud log
 
 The `m5stickc-plus` env pins **M5Unified**,
 **ArduinoJson** v7, and the Hopperpop **SGP4** library, on
-`board = m5stick-c` (the PlatformIO id for the StickC family) with the 4 MB
-partition table (`default_4MB.csv`, app + LittleFS). PSRAM is **not** enabled.
+`board = m5stick-c` (the PlatformIO id for the StickC family) with the bundled
+4 MB partition table (`partitions_4mb.csv`, single app + a large LittleFS data
+region). PSRAM is **not** enabled.
 
 ### Memory note (no PSRAM)
 
@@ -146,7 +183,8 @@ Arduino IDE. Install **M5Unified** (pulls in M5GFX), **ArduinoJson** (v7), and
 the Hopperpop **Sgp4** library (Add .ZIP Library from
 <https://github.com/Hopperpop/Sgp4-Library>). Board: **M5StickC-Plus** (ESP32
 PICO, 4 MB flash, a partition scheme with a SPIFFS/LittleFS region). Do **not**
-enable PSRAM (the PICO-D4 has none).
+enable PSRAM (the PICO-D4 has none). The optional GPS needs **no extra library** —
+NMEA is parsed in `gps.cpp`.
 
 ---
 
@@ -161,15 +199,19 @@ enable PSRAM (the PICO-D4 has none).
 TLS uses `setInsecure()` (no certificate validation) — fine for public data;
 pin a CA root if you need it.
 
+Optional hardware: **M5Stack Unit GPS v1.1** (ATGM336H/AT6668, NMEA 0183 over
+UART at 115200) on the Grove port — ESP32 RX=G33, TX=G32.
+
 ---
 
 ## File map
 
 ```
 platformio.ini      board, libs, build flags (M5StickC Plus / ESP32-PICO, 4MB, no PSRAM)
+partitions_4mb.csv  4 MB partition table: single app + large LittleFS region
 StickSat.ino        generated single-file Arduino build
-main.cpp            entry point: boot -> portal -> setup server -> App
-config.h            URLs, button pins, limits, file paths
+main.cpp            entry point: boot -> (first-run portal/setup) -> App
+config.h            URLs, button + GPS pins, limits, file paths
 storage.{h,cpp}     LittleFS filesystem layer
 settings.{h,cpp}    persisted config (WiFi, location, min elev, alarm)
 satdb.{h,cpp}       GP/OMM store + TLE rebuild + streaming parse + transponders
@@ -180,7 +222,7 @@ gps.{h,cpp}         optional Grove GPS (Unit GPS v1.1): NMEA time + location
 favs.{h,cpp}        the user's selected satellites (up to 20)
 buttons.{h,cpp}     KEY1 / KEY2 over M5Unified BtnA / BtnB (short + long press), wake pin
 portal.{h,cpp}      captive WiFi portal + location/satellite setup web server
-app.{h,cpp}         3-screen UI state machine, AOS alarm, deep sleep
+app.{h,cpp}         4-screen UI state machine, GPS, AOS alarm, deep sleep, clock entry
 ```
 
 ## Credits

@@ -715,7 +715,7 @@ void App::loop() {
 
   // Periodic redraw so the live clock / countdown / polar marker animate.
   uint32_t ms = millis();
-  uint32_t period = (screen == SCR_POLAR || screen == SCR_TRACK) ? 500 : 1000;
+  uint32_t period = (screen == SCR_POLAR || screen == SCR_TRACK || screen == SCR_GPS) ? 500 : 1000;
   if (ms - lastDrawMs > period) { lastDrawMs = ms; draw(); }
 
   // While an AOS alarm is flashing or counting down, animate on any screen.
@@ -749,6 +749,7 @@ void App::nextScreen() {
 }
 
 void App::advanceSelection() {
+  if (screen == SCR_GPS) return;             // nothing to cycle on the GPS page
   if (screen == SCR_TRACK) {
     if (activeTxCount > 0) { curTx = (curTx + 1) % activeTxCount; }
     return;
@@ -865,6 +866,7 @@ void App::draw() {
     case SCR_PASSES: drawPasses(); break;
     case SCR_POLAR:  drawPolar();  break;
     case SCR_TRACK:  drawTrack();  break;
+    case SCR_GPS:    drawGps();    break;
     default: break;
   }
 
@@ -1199,4 +1201,90 @@ void App::drawTrack() {
     g->setCursor(4, 112); g->print("Set location in WiFi setup");
   }
   footer("KEY1 screen  KEY2 next TX");
+}
+
+// ---- Screen 4: GPS status -------------------------------------------------
+//  Location (lat/lon/alt + 6-digit Maidenhead), UTC time, satellite count, and
+//  link state. Works whether or not a GPS unit is attached: with none, it shows
+//  "no GPS detected"; with one searching, "acquiring..."; with a fix, the data.
+void App::drawGps() {
+  header("GPS");
+  g->setTextSize(1);
+
+  bool fix      = gps.hasFix();
+  bool anyData  = (gps.lastByteMs() != 0);            // have we ever seen bytes?
+  bool linkLive = anyData && (millis() - gps.lastByteMs() < 3000);
+
+  // Status line.
+  g->setCursor(4, 20);
+  if (fix)            { g->setTextColor(CL_GREEN,  CL_BLACK); g->print("FIX"); }
+  else if (linkLive)  { g->setTextColor(CL_YELLOW, CL_BLACK); g->print("acquiring..."); }
+  else if (anyData)   { g->setTextColor(CL_ORANGE, CL_BLACK); g->print("no data (check unit)"); }
+  else                { g->setTextColor(CL_GREY,   CL_BLACK); g->print("no GPS detected"); }
+
+  // Satellites in use (from GGA), shown top-right of the status row.
+  if (anyData) {
+    g->setTextColor(CL_WHITE, CL_BLACK);
+    g->setCursor(150, 20); g->printf("sats %d", gps.sats());
+  }
+
+  if (fix) {
+    double la = gps.lat(), lo = gps.lon(), al = gps.altM();
+
+    g->setTextColor(CL_WHITE, CL_BLACK);
+    g->setCursor(4, 36);
+    g->printf("Lat %9.5f %c", fabs(la), la >= 0 ? 'N' : 'S');
+    g->setCursor(4, 48);
+    g->printf("Lon %9.5f %c", fabs(lo), lo >= 0 ? 'E' : 'W');
+    g->setCursor(4, 60);
+    g->printf("Alt %.0f m", al);
+
+    // 6-digit Maidenhead grid (big, it's the headline number for hams).
+    String grid = Location::toGrid(la, lo);
+    g->setTextColor(CL_CYAN, CL_BLACK);
+    g->setCursor(150, 36); g->print("Grid");
+    g->setTextSize(2);
+    g->setCursor(150, 48); g->print(grid);
+    g->setTextSize(1);
+
+    // UTC date + time from the GPS.
+    if (gps.timeValid()) {
+      time_t t = gps.utc();
+      struct tm tmv; gmtime_r(&t, &tmv);
+      g->setTextColor(CL_WHITE, CL_BLACK);
+      g->setCursor(4, 78);
+      g->printf("%04d-%02d-%02d", tmv.tm_year + 1900, tmv.tm_mon + 1, tmv.tm_mday);
+      g->setTextColor(CL_GREEN, CL_BLACK);
+      g->setCursor(4, 90);
+      g->printf("%02d:%02d:%02d UTC", tmv.tm_hour, tmv.tm_min, tmv.tm_sec);
+    }
+
+    // Note whether this fix has been adopted as the station location/clock.
+    g->setTextColor(CL_GREY, CL_BLACK);
+    g->setCursor(4, 104);
+    if (gpsLocApplied) g->print("station loc set from GPS");
+    else               g->print("fix not yet applied");
+  } else {
+    // No fix: explain and, if we have a clock from elsewhere, still show UTC.
+    g->setTextColor(CL_GREY, CL_BLACK);
+    g->setCursor(4, 40);
+    if (!anyData) {
+      g->print("Plug an M5 Unit GPS into");
+      g->setCursor(4, 52); g->print("the Grove port. Cold start");
+      g->setCursor(4, 64); g->print("can take ~30s with sky view.");
+    } else {
+      g->print("Searching for satellites.");
+      g->setCursor(4, 52); g->print("Needs a clear view of sky;");
+      g->setCursor(4, 64); g->print("cold start ~30s.");
+    }
+    if (timeIsSet()) {
+      time_t t = nowUtc();
+      struct tm tmv; gmtime_r(&t, &tmv);
+      g->setTextColor(CL_WHITE, CL_BLACK);
+      g->setCursor(4, 90);
+      g->printf("clock: %02d:%02d:%02d UTC", tmv.tm_hour, tmv.tm_min, tmv.tm_sec);
+    }
+  }
+
+  footer("KEY1 screen");
 }

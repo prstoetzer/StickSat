@@ -8,6 +8,7 @@
 //                  the active satellite is below the horizon
 //    SCR_TRACK   : Doppler / pass detail for the active sat's transponders
 //                  (KEY2 cycles transponders); no radio, rotator or calibration
+//    SCR_GPS     : GPS status -- lat/lon/alt, 6-digit grid, UTC, satellites
 //
 //  KEY2 advances the active satellite on PASSES/POLAR, or the transponder on
 //  TRACK; both wrap at the end of the list.
@@ -22,7 +23,7 @@
 #include "predict.h"
 #include "gps.h"
 
-enum Screen : uint8_t { SCR_PASSES = 0, SCR_POLAR, SCR_TRACK, SCR_COUNT };
+enum Screen : uint8_t { SCR_PASSES = 0, SCR_POLAR, SCR_TRACK, SCR_GPS, SCR_COUNT };
 
 // One upcoming (or in-progress) pass for a selected satellite. Every selected
 // favorite gets an entry, even if no near-term pass was found (hasPass=false),
@@ -118,6 +119,7 @@ private:
   void drawPasses();
   void drawPolar();
   void drawTrack();
+  void drawGps();
   void header(const String& t);
   void footer(const String& t);
 };
